@@ -1,0 +1,48 @@
+name: Rust OmniOS CI
+
+on:
+  push:
+    paths:
+      - "rust/**"
+      - ".github/workflows/ci-omnios.yml"
+  pull_request:
+    paths:
+      - "rust/**"
+      - ".github/workflows/ci-omnios.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-omnios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test on OmniOS r151058-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Run Rust tests on OmniOS
+        uses: vmactions/omnios-vm@v1
+        with:
+          release: r151058-build
+          copyback: false
+          cache-after-prepare: true
+          prepare: |
+            pkg publisher extra.omnios >/dev/null 2>&1 || pkg set-publisher -g https://pkg.omnios.org/r151058/extra extra.omnios
+            pkg refresh extra.omnios
+            pkg install --accept ooce/developer/protobuf ooce/developer/rust
+          run: |
+            export PATH=/opt/ooce/bin:/opt/ooce/sbin:/usr/gnu/bin:/usr/bin:/usr/sbin:/sbin
+            export PROTOC=/opt/ooce/bin/protoc
+            export AR_x86_64_unknown_illumos=ar
+
+            rustc --version
+            cargo --version
+            "$PROTOC" --version
+
+            cd rust
+            cargo test --workspace --locked
