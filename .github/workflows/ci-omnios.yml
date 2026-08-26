@@ -34,9 +34,16 @@ jobs:
           prepare: |
             pkg publisher extra.omnios >/dev/null 2>&1 || pkg set-publisher -g https://pkg.omnios.org/r151058/extra extra.omnios
             pkg refresh extra.omnios
-            pkg install --accept ooce/developer/protobuf ooce/developer/rust
+            pkg install --accept ooce/developer/protobuf
+
+            export RUSTUP_HOME=/opt/rustup
+            export CARGO_HOME=/opt/cargo
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
           run: |
-            export PATH=/opt/ooce/bin:/opt/ooce/sbin:/usr/gnu/bin:/usr/bin:/usr/sbin:/sbin
+            export RUSTUP_HOME=/opt/rustup
+            export CARGO_HOME="$HOME/.cargo"
+            export PATH=/opt/cargo/bin:/opt/ooce/bin:/opt/ooce/sbin:/usr/gnu/bin:/usr/bin:/usr/sbin:/sbin
             export PROTOC=/opt/ooce/bin/protoc
             export AR_x86_64_unknown_illumos=ar
 
