@@ -52,4 +52,4 @@ jobs:
             "$PROTOC" --version
 
             cd rust
-            cargo test --workspace --locked --jobs 2
+            cargo test --workspace --locked --jobs 2 -- --test-threads 2
