@@ -4,10 +4,12 @@ on:
   push:
     paths:
       - "rust/**"
+      - "conformance/mock_server/**"
       - ".github/workflows/ci-omnios.yml"
   pull_request:
     paths:
       - "rust/**"
+      - "conformance/mock_server/**"
       - ".github/workflows/ci-omnios.yml"
   workflow_dispatch:
 
