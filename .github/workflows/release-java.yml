@@ -16,6 +16,7 @@ on:
 
 jobs:
   build-jar:
+    if: github.repository == 'databricks/zerobus-sdk'
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest

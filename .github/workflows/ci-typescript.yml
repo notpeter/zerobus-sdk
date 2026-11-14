@@ -16,7 +16,9 @@ jobs:
           - runner: { group: databricks-protected-runner-group, labels: windows-server-latest }
             target: x86_64-pc-windows-msvc
     name: Build - ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: >-
+      ${{ github.repository == 'databricks/zerobus-sdk' && matrix.runner
+          || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-latest') }}
     defaults:
       run:
         working-directory: typescript
@@ -24,12 +26,15 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Get JFrog OIDC token
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
       - name: Configure Cargo registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-cargo.sh"
       - name: Configure npm registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-npm.sh"
       - name: Setup Node.js
@@ -78,7 +83,9 @@ jobs:
 
   test:
     name: Test Node.js ${{ matrix.node }} - ${{ matrix.os }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: >-
+      ${{ github.repository == 'databricks/zerobus-sdk' && matrix.runner
+          || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-latest') }}
     strategy:
       fail-fast: false
       matrix:
@@ -102,12 +109,15 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Get JFrog OIDC token
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
       - name: Configure Cargo registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-cargo.sh"
       - name: Configure npm registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-npm.sh"
       - name: Setup Node.js ${{ matrix.node }}

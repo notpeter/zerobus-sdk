@@ -10,21 +10,25 @@ on:
 
 jobs:
   fmt:
-    runs-on:
-      group: databricks-protected-runner-group
-      labels: linux-ubuntu-latest
+    runs-on: >-
+      ${{ github.repository == 'databricks/zerobus-sdk'
+          && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
+          || 'ubuntu-latest' }}
     defaults:
       run:
         working-directory: go
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Get JFrog OIDC token
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
       - name: Configure Cargo registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-cargo.sh"
       - name: Configure Go registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: |
           echo "GOPROXY=https://databricks.jfrog.io/artifactory/api/go/db-golang,direct" >> "$GITHUB_ENV"
@@ -51,21 +55,25 @@ jobs:
         run: git diff --exit-code
 
   lint:
-    runs-on:
-      group: databricks-protected-runner-group
-      labels: linux-ubuntu-latest
+    runs-on: >-
+      ${{ github.repository == 'databricks/zerobus-sdk'
+          && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
+          || 'ubuntu-latest' }}
     defaults:
       run:
         working-directory: go
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Get JFrog OIDC token
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
       - name: Configure Cargo registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-cargo.sh"
       - name: Configure Go registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: |
           echo "GOPROXY=https://databricks.jfrog.io/artifactory/api/go/db-golang,direct" >> "$GITHUB_ENV"
@@ -97,7 +105,9 @@ jobs:
             runner: { group: databricks-protected-runner-group, labels: linux-ubuntu-latest }
           - os: windows-server-latest
             runner: { group: databricks-protected-runner-group, labels: windows-server-latest }
-    runs-on: ${{ matrix.runner }}
+    runs-on: >-
+      ${{ github.repository == 'databricks/zerobus-sdk' && matrix.runner
+          || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-latest') }}
     defaults:
       run:
         working-directory: go
@@ -105,12 +115,15 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Get JFrog OIDC token
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
       - name: Configure Cargo registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-cargo.sh"
       - name: Configure Go registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: |
           echo "GOPROXY=https://databricks.jfrog.io/artifactory/api/go/db-golang,direct" >> "$GITHUB_ENV"
@@ -163,7 +176,9 @@ jobs:
           - os: windows-server-latest
             runner: { group: databricks-protected-runner-group, labels: windows-server-latest }
             lib: lib/windows_amd64/libzerobus_ffi.a
-    runs-on: ${{ matrix.runner }}
+    runs-on: >-
+      ${{ github.repository == 'databricks/zerobus-sdk' && matrix.runner
+          || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-latest') }}
     defaults:
       run:
         working-directory: go
@@ -171,12 +186,15 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Get JFrog OIDC token
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
       - name: Configure Cargo registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-cargo.sh"
       - name: Configure Go registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: |
           echo "GOPROXY=https://databricks.jfrog.io/artifactory/api/go/db-golang,direct" >> "$GITHUB_ENV"

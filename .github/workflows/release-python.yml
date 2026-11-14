@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   build-linux:
+    if: github.repository == 'databricks/zerobus-sdk'
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
@@ -81,6 +82,7 @@ jobs:
           if-no-files-found: error
 
   build-windows:
+    if: github.repository == 'databricks/zerobus-sdk'
     runs-on:
       group: databricks-protected-runner-group
       labels: windows-server-latest
@@ -130,6 +132,7 @@ jobs:
           if-no-files-found: error
 
   sdist:
+    if: github.repository == 'databricks/zerobus-sdk'
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
@@ -177,7 +180,7 @@ jobs:
           if-no-files-found: error
 
   import-macos:
-    if: inputs.macos-binaries-release != ''
+    if: github.repository == 'databricks/zerobus-sdk' && (inputs.macos-binaries-release != '')
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest

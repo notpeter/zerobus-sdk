@@ -5,18 +5,21 @@ on:
 
 jobs:
   fmt:
-    runs-on:
-      group: databricks-protected-runner-group
-      labels: linux-ubuntu-latest
+    runs-on: >-
+      ${{ github.repository == 'databricks/zerobus-sdk'
+          && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
+          || 'ubuntu-latest' }}
     defaults:
       run:
         working-directory: java
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Get JFrog OIDC token
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
       - name: Configure Cargo registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-cargo.sh"
       - name: Set up JDK 11
@@ -26,6 +29,7 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
       - name: Configure Maven registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-maven.sh"
       - name: Check formatting
@@ -53,16 +57,20 @@ jobs:
           - os: windows-server-latest
             runner: { group: databricks-protected-runner-group, labels: windows-server-latest }
             javaVersion: '21'
-    runs-on: ${{ matrix.runner }}
+    runs-on: >-
+      ${{ github.repository == 'databricks/zerobus-sdk' && matrix.runner
+          || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-latest') }}
     defaults:
       run:
         working-directory: java
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Get JFrog OIDC token
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
       - name: Configure Cargo registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-cargo.sh"
       - name: Unshallow
@@ -74,6 +82,7 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
       - name: Configure Maven registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-maven.sh"
       - name: Install Rust toolchain

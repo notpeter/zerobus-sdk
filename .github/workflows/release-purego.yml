@@ -13,6 +13,7 @@ permissions:
 
 jobs:
   build:
+    if: github.repository == 'databricks/zerobus-sdk'
     name: Build and test
     runs-on:
       group: databricks-protected-runner-group

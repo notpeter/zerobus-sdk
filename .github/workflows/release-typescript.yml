@@ -12,6 +12,7 @@ on:
 
 jobs:
   build:
+    if: github.repository == 'databricks/zerobus-sdk'
     strategy:
       fail-fast: false
       matrix:
@@ -93,7 +94,7 @@ jobs:
   # Darwin .node files are not compiled here. Added binaries must include
   # Arrow Flight and Avro (`npm run build:all`).
   import-macos:
-    if: inputs.macos-binaries-release != ''
+    if: github.repository == 'databricks/zerobus-sdk' && (inputs.macos-binaries-release != '')
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest

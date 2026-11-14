@@ -13,6 +13,7 @@ concurrency:
 
 jobs:
   build-ffi:
+    if: github.repository == 'databricks/zerobus-sdk'
     strategy:
       fail-fast: false
       matrix:
@@ -131,6 +132,7 @@ jobs:
           if-no-files-found: error
 
   package:
+    if: github.repository == 'databricks/zerobus-sdk'
     name: Pack NuGet package
     needs: build-ffi
     runs-on:

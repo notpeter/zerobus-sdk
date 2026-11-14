@@ -12,7 +12,7 @@ on:
 
 jobs:
   import-macos:
-    if: inputs.macos-binaries-release != ''
+    if: github.repository == 'databricks/zerobus-sdk' && (inputs.macos-binaries-release != '')
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
@@ -51,6 +51,7 @@ jobs:
           if-no-files-found: error
 
   build-jni:
+    if: github.repository == 'databricks/zerobus-sdk'
     strategy:
       fail-fast: false
       matrix:

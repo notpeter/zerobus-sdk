@@ -6,6 +6,7 @@ on:
 
 jobs:
   build-ffi:
+    if: github.repository == 'databricks/zerobus-sdk'
     strategy:
       fail-fast: false
       matrix:

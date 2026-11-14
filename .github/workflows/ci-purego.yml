@@ -11,9 +11,10 @@ on:
 
 jobs:
   fmt:
-    runs-on:
-      group: databricks-protected-runner-group
-      labels: linux-ubuntu-latest
+    runs-on: >-
+      ${{ github.repository == 'databricks/zerobus-sdk'
+          && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
+          || 'ubuntu-latest' }}
     defaults:
       run:
         working-directory: purego
@@ -39,18 +40,21 @@ jobs:
   # that forgot to regenerate them. Tooling is pinned to the versions in
   # internal/zerobuspb/gen.go so regeneration is byte-for-byte reproducible.
   generate:
-    runs-on:
-      group: databricks-protected-runner-group
-      labels: linux-ubuntu-latest
+    runs-on: >-
+      ${{ github.repository == 'databricks/zerobus-sdk'
+          && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
+          || 'ubuntu-latest' }}
     defaults:
       run:
         working-directory: purego
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Get JFrog OIDC token
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
       - name: Configure Go registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: |
           echo "GOPROXY=https://databricks.jfrog.io/artifactory/api/go/db-golang,direct" >> "$GITHUB_ENV"
@@ -94,18 +98,21 @@ jobs:
           fi
 
   vet:
-    runs-on:
-      group: databricks-protected-runner-group
-      labels: linux-ubuntu-latest
+    runs-on: >-
+      ${{ github.repository == 'databricks/zerobus-sdk'
+          && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
+          || 'ubuntu-latest' }}
     defaults:
       run:
         working-directory: purego
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Get JFrog OIDC token
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
       - name: Configure Go registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: |
           echo "GOPROXY=https://databricks.jfrog.io/artifactory/api/go/db-golang,direct" >> "$GITHUB_ENV"
@@ -125,9 +132,10 @@ jobs:
         run: go vet ./...
 
   test:
-    runs-on:
-      group: databricks-protected-runner-group
-      labels: linux-ubuntu-latest
+    runs-on: >-
+      ${{ github.repository == 'databricks/zerobus-sdk'
+          && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
+          || 'ubuntu-latest' }}
     defaults:
       run:
         working-directory: purego
@@ -135,9 +143,11 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Get JFrog OIDC token
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
       - name: Configure Go registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: |
           echo "GOPROXY=https://databricks.jfrog.io/artifactory/api/go/db-golang,direct" >> "$GITHUB_ENV"

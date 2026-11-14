@@ -10,9 +10,10 @@ on:
 
 jobs:
   fmt:
-    runs-on:
-      group: databricks-protected-runner-group
-      labels: linux-ubuntu-latest
+    runs-on: >-
+      ${{ github.repository == 'databricks/zerobus-sdk'
+          && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
+          || 'ubuntu-latest' }}
     defaults:
       run:
         working-directory: dotnet
@@ -49,7 +50,9 @@ jobs:
             runner: { group: databricks-protected-runner-group, labels: linux-ubuntu-latest }
           - os: windows-server-latest
             runner: { group: databricks-protected-runner-group, labels: windows-server-latest }
-    runs-on: ${{ matrix.runner }}
+    runs-on: >-
+      ${{ github.repository == 'databricks/zerobus-sdk' && matrix.runner
+          || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-latest') }}
     defaults:
       run:
         working-directory: dotnet
@@ -70,9 +73,11 @@ jobs:
 
       # Protected runners can't reach crates.io; route cargo through JFrog.
       - name: Get JFrog OIDC token
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
       - name: Configure Cargo registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-cargo.sh"
 
@@ -100,7 +105,9 @@ jobs:
           - os: windows-server-latest
             runner: { group: databricks-protected-runner-group, labels: windows-server-latest }
             lib: lib/windows_amd64/libzerobus_ffi.a
-    runs-on: ${{ matrix.runner }}
+    runs-on: >-
+      ${{ github.repository == 'databricks/zerobus-sdk' && matrix.runner
+          || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-latest') }}
     defaults:
       run:
         working-directory: dotnet
@@ -116,9 +123,11 @@ jobs:
 
       # Protected runners can't reach crates.io; route cargo through JFrog.
       - name: Get JFrog OIDC token
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
       - name: Configure Cargo registry
+        if: github.repository == 'databricks/zerobus-sdk'
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-cargo.sh"
 
