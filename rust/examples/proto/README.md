@@ -13,6 +13,7 @@ This directory contains examples demonstrating Protocol Buffers-based data inges
 - [Compiled: Batch Example](#compiled-batch-example)
   - [Running the Example](#running-the-example-1)
   - [Code Highlights](#code-highlights-1)
+- [Multiplexed Stream Example](#multiplexed-stream-example)
 - [Dynamic Schema Example](#dynamic-schema-example)
   - [Running the Example](#running-the-example-2)
   - [Code Highlights](#code-highlights-2)
@@ -39,6 +40,7 @@ The examples are grouped by how the protobuf schema is obtained:
   are already included.
   - **`compiled/single.rs`** - Ingest records one at a time using `ingest_record_offset()`
   - **`compiled/batch.rs`** - Ingest multiple records at once using `ingest_records_offset()`
+  - **`compiled/multiplexed.rs`** - Let one logical stream route across four managed sub-streams
 - **`dynamic/`** — the schema is known only at runtime (no compiled `.proto`), and records
   are built field-by-field with `DynamicRecord`.
   - **`dynamic/single.rs`** - Build the descriptor in code and ingest dynamic records one at a time
@@ -63,7 +65,7 @@ The SDK supports three approaches for passing Protocol Buffers data:
 
 ### Running the Example
 
-1. Configure credentials in `compiled/single.rs` (see [Prerequisites](../README.md#prerequisites))
+1. Export the environment variables listed in [Prerequisites](../README.md#3-configure-credentials)
 
 2. Run the example:
    ```bash
@@ -122,8 +124,8 @@ let descriptor_proto = load_descriptor_proto(
 
 let stream = sdk
     .stream_builder()
-    .table(TABLE_NAME)
-    .oauth(DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET)
+    .table(&config.table_name)
+    .oauth(&config.client_id, &config.client_secret)
     .compiled_proto(descriptor_proto)
     .build()
     .await?;
@@ -133,7 +135,7 @@ let stream = sdk
 
 ### Running the Example
 
-1. Configure credentials in `compiled/batch.rs` (see [Prerequisites](../README.md#prerequisites))
+1. Export the environment variables listed in [Prerequisites](../README.md#3-configure-credentials)
 
 2. Run the example:
    ```bash
@@ -185,6 +187,29 @@ stream.flush().await?;
 - **Single acknowledgment**: One offset ID for the whole batch
 - **Empty batches**: Returns `None` (no-op)
 
+## Multiplexed Stream Example
+
+When you need more throughput than one gRPC stream can provide and do not need
+global ordering, the multiplexed builder creates one logical stream over
+several homogeneous sub-streams:
+
+```bash
+cargo run -p rust-examples-proto --example proto_compiled_multiplexed
+```
+
+Configure every option before the terminal `.multiplexed(4)` call. Ingest
+returns a `MessageId`; queue records, flush periodically and at the end, then
+close the mux. The complete example also shows
+`multiplexed_ack_callback` with `AckCallback<MessageId>`.
+
+`max_inflight_requests` is shared across the mux: each sub-stream receives the
+configured value divided by the stream count. Configure at least one in-flight
+request per sub-stream.
+
+Records preserve ordering within each sub-stream, but there is no global
+record, message-ID, or callback order. Callback workers for different
+sub-streams can invoke the shared callback concurrently.
+
 ## Dynamic Schema Example
 
 `dynamic/single.rs` covers the case where the table's schema is known only at runtime
@@ -195,7 +220,7 @@ field-by-field with `DynamicRecord`.
 
 ### Running the Example
 
-1. Configure credentials in `dynamic/single.rs` (see [Prerequisites](../README.md#prerequisites))
+1. Export the environment variables listed in [Prerequisites](../README.md#3-configure-credentials)
 
 2. Run the example:
    ```bash
@@ -221,8 +246,8 @@ let descriptor = message_descriptor(&descriptor_proto)?;
 
 let mut stream = sdk
     .stream_builder()
-    .table(TABLE_NAME)
-    .oauth(DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET)
+    .table(&config.table_name)
+    .oauth(&config.client_id, &config.client_secret)
     .dynamic_proto(descriptor)
     .build()
     .await?;
@@ -283,7 +308,7 @@ Run this from the repository root directory:
 cd tools/generate_files
 
 cargo run -- \
-  --uc-endpoint "https://<your-workspace>.cloud.databricks.com" \
+  --uc-endpoint "<your-databricks-workspace-url>" \
   --client-id "<your-client-id>" \
   --client-secret "<your-client-secret>" \
   --table "<catalog.schema.your_table>" \
@@ -353,4 +378,5 @@ ProtoMessage(TableInventory {
 })
 ```
 
-**4. Update table name and credentials** in the constants at the top of `single.rs` or `batch.rs`.
+**4. Configure the environment variables** listed in the
+[examples prerequisites](../README.md#3-configure-credentials).

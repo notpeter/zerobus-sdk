@@ -1,6 +1,6 @@
 """Type stubs for _zerobus_core Rust module."""
 
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Awaitable, Callable, List, Optional, Tuple, Union
 
 from typing_extensions import Self
 
@@ -12,8 +12,10 @@ class RecordType:
     """Type of records to ingest into the stream."""
 
     value: int
+    UNSPECIFIED: RecordType
     PROTO: RecordType
     JSON: RecordType
+    AVRO: RecordType
 
     def __int__(self) -> int: ...
     def __eq__(self, other: Self) -> bool: ...
@@ -22,10 +24,20 @@ class RecordType:
 class TableProperties:
     """Table properties for the stream."""
 
+    # Readable attributes (getters). descriptor_proto is a constructor-only param
+    # (no getter), so it is intentionally not listed here.
     table_name: str
-    descriptor_proto: Optional[bytes]
+    # Avro writer schema (JSON); mutually exclusive with descriptor_proto
+    avro_schema: Optional[str]
+    # Record format this stream will use: "proto", "json", or "avro"
+    record_format: str
 
-    def __init__(self, table_name: str, descriptor_proto: Optional[Union[bytes, Any]] = None) -> None:
+    def __init__(
+        self,
+        table_name: str,
+        descriptor_proto: Optional[Union[bytes, Any]] = None,
+        avro_schema: Optional[str] = None,
+    ) -> None:
         """
         Create table properties.
 
@@ -35,6 +47,7 @@ class TableProperties:
                 - bytes: Serialized FileDescriptorProto
                 - Descriptor: Protobuf Descriptor object (e.g., MyMessage.DESCRIPTOR)
                 - None: For JSON mode (no descriptor needed)
+            avro_schema: Avro writer schema (JSON string); mutually exclusive with descriptor_proto
         """
         ...
 
@@ -112,7 +125,7 @@ class StreamConfigurationOptions:
     """Timeout for flushing the stream in milliseconds (default: 300000)"""
 
     record_type: RecordType
-    """Type of records to ingest into the stream (default: RecordType.PROTO)"""
+    """Optional record format; when not UNSPECIFIED it must match the format inferred from TableProperties (default: RecordType.UNSPECIFIED)"""
 
     stream_paused_max_wait_time_ms: Optional[int]
     """Maximum time in milliseconds to wait during graceful stream close (default: None - wait for full server duration)"""
@@ -148,7 +161,7 @@ class StreamConfigurationOptions:
             recovery_retries: Maximum number of recovery attempts (default: 4)
             server_lack_of_ack_timeout_ms: Server acknowledgment timeout in ms (default: 60000)
             flush_timeout_ms: Flush operation timeout in ms (default: 300000)
-            record_type: Serialization format (default: RecordType.PROTO)
+            record_type: Optional record format; must match the format inferred from TableProperties when not UNSPECIFIED (default: RecordType.UNSPECIFIED)
             stream_paused_max_wait_time_ms: Max wait time during graceful close in ms (default: None)
             callback_max_wait_time_ms: Max wait time for callbacks after close in ms (default: 5000)
             ack_callback: Callback invoked once per successfully queued ingest submission that later acknowledges or fails (default: None)
@@ -156,6 +169,27 @@ class StreamConfigurationOptions:
         ...
 
     def __repr__(self) -> str: ...
+
+class PersistentStreamSettings:
+    """Settings collected by ``PersistentStreamBuilder``. Internal; not for direct use."""
+
+    def __init__(
+        self,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        headers_provider: Optional[Any] = None,
+        recovery: Optional[bool] = None,
+        recovery_timeout_ms: Optional[int] = None,
+        recovery_backoff_ms: Optional[int] = None,
+        recovery_retries: Optional[int] = None,
+        server_lack_of_ack_timeout_ms: Optional[int] = None,
+        flush_timeout_ms: Optional[int] = None,
+        max_inflight_requests: Optional[int] = None,
+        max_ingest_payload_bytes: Optional[int] = None,
+        ack_callback: Optional[AckCallback] = None,
+        callback_max_wait_time_ms_set: bool = False,
+        callback_max_wait_time_ms: Optional[int] = None,
+    ) -> None: ...
 
 # =============================================================================
 # EXCEPTIONS
@@ -197,6 +231,33 @@ class HeadersProvider:
         - ("x-databricks-zerobus-table-name", "<table_name>")
         """
         ...
+
+    def invalidate(self) -> None:
+        """Optional hook to drop cached auth state after the server rejects a token.
+
+        The default is a no-op. Override it in a subclass that caches credentials
+        so a rejected token is re-fetched on the next get_headers() call.
+        """
+        ...
+
+class IdpSupplier:
+    """
+    Opaque, short-lived handle wrapping one external-IdP token supplier.
+
+    Rebuilt per create_stream from a FederatedToken's idp_token_supplier callback
+    and bound to that SDK's event loop and sync/async policy (via allow_async).
+    Cross-stream cache sharing is preserved by cache_identity, the owning
+    FederatedToken's stable per-instance id, which partitions the account-level
+    token cache. Managed internally by the SDK; not constructed directly by user
+    code.
+    """
+
+    def __init__(
+        self,
+        idp_token_supplier: Callable[[], Union[str, Awaitable[str]]],
+        allow_async: bool,
+        cache_identity: str,
+    ) -> None: ...
 
 # =============================================================================
 # SYNC SDK
@@ -311,10 +372,68 @@ class sync:
             """Get the number of unacknowledged records."""
             ...
 
+    class PersistentStream:
+        """A durable, recoverable ingestion stream (Eos).
+
+        Create or resume one with ``ZerobusSdk.persistent_stream_builder()``. Ingest in a loop,
+        then call ``flush()`` once to confirm the batch.
+        """
+
+        @property
+        def stream_id(self) -> Optional[str]:
+            """The durable stream identity. Persist it to resume the stream later."""
+            ...
+
+        @property
+        def resume_watermark(self) -> Optional[int]:
+            """The offset the server had committed when the stream opened, or ``None`` if nothing
+            was committed yet (always ``None`` for a new stream)."""
+            ...
+
+        @property
+        def is_closed(self) -> bool:
+            """Whether the stream is closed. A close that is in progress counts as closed."""
+            ...
+
+        def ingest_record_offset(self, payload: Any) -> int:
+            """Queue a record and return its offset. Does not wait for the acknowledgment."""
+            ...
+
+        def ingest_records_offset(self, payloads: Any) -> Optional[int]:
+            """Queue a batch and return one offset for it, or ``None`` for an empty batch."""
+            ...
+
+        def wait_for_offset(self, offset: int) -> None:
+            """Wait until the server acknowledges ``offset``."""
+            ...
+
+        def flush(self) -> None:
+            """Wait until the server acknowledges all pending records."""
+            ...
+
+        def close(self) -> None:
+            """Flush pending records and close the stream."""
+            ...
+
     class ZerobusSdk:
         """Main entry point for synchronous Zerobus ingestion."""
 
-        def __init__(self, host: str, unity_catalog_url: str, application_name: Optional[str] = None) -> None:
+        def open_persistent_stream(
+            self,
+            table_properties: TableProperties,
+            settings: PersistentStreamSettings,
+            resume_stream_id: Optional[str] = None,
+        ) -> "PersistentStream":
+            """Open a new persistent stream, or resume one when ``resume_stream_id`` is set."""
+            ...
+
+        def __init__(
+            self,
+            host: str,
+            unity_catalog_url: str,
+            application_name: Optional[str] = None,
+            connection_per_stream: bool = True,
+        ) -> None:
             """
             Create a synchronous Zerobus SDK instance.
 
@@ -324,6 +443,8 @@ class sync:
                 application_name: Optional caller identifier (conventionally
                     "<product>/<version>") appended to the HTTP user-agent header on
                     gRPC requests toward the Zerobus server.
+                connection_per_stream: Whether each JSON/protobuf stream gets a
+                    dedicated gRPC connection. Defaults to True.
             """
             ...
 
@@ -371,6 +492,34 @@ class sync:
             Args:
                 table_properties: Table properties
                 headers_provider: Custom headers provider
+                options: Optional configuration options
+
+            Returns:
+                A new ZerobusStream
+            """
+            ...
+
+        def create_stream_federated(
+            self,
+            table_properties: TableProperties,
+            idp_supplier: IdpSupplier,
+            databricks_client_id: Optional[str] = None,
+            options: Optional[StreamConfigurationOptions] = None,
+        ) -> "ZerobusStream":
+            """
+            Create a new stream with external-IdP federation (RFC 8693 token exchange).
+
+            Args:
+                table_properties: Table properties
+                idp_supplier: Short-lived supplier handle, rebuilt per create_stream
+                    (so it binds to this SDK's event loop and sync/async policy); the
+                    cache identity carried on the FederatedToken partitions the
+                    account-level token cache. The supplier carries a GC-visible
+                    holder for the callback (and any async context) that it references
+                    only weakly; the stream takes the sole retained strong reference,
+                    so a self-referential owner/stream/callback cycle stays collectable
+                databricks_client_id: Service principal client_id for workload
+                    identity federation, or None for account-level federation
                 options: Optional configuration options
 
             Returns:
@@ -464,10 +613,68 @@ class aio:
             """Get the number of unacknowledged records."""
             ...
 
+    class PersistentStream:
+        """A durable, recoverable ingestion stream (Eos).
+
+        Create or resume one with ``ZerobusSdk.persistent_stream_builder()``. Ingest in a loop,
+        then call ``flush()`` once to confirm the batch.
+        """
+
+        @property
+        def stream_id(self) -> Optional[str]:
+            """The durable stream identity. Persist it to resume the stream later."""
+            ...
+
+        @property
+        def resume_watermark(self) -> Optional[int]:
+            """The offset the server had committed when the stream opened, or ``None`` if nothing
+            was committed yet (always ``None`` for a new stream)."""
+            ...
+
+        @property
+        def is_closed(self) -> bool:
+            """Whether the stream is closed. A close that is in progress counts as closed."""
+            ...
+
+        async def ingest_record_offset(self, payload: Any) -> int:
+            """Queue a record and return its offset. Does not wait for the acknowledgment."""
+            ...
+
+        async def ingest_records_offset(self, payloads: Any) -> Optional[int]:
+            """Queue a batch and return one offset for it, or ``None`` for an empty batch."""
+            ...
+
+        async def wait_for_offset(self, offset: int) -> None:
+            """Wait until the server acknowledges ``offset``."""
+            ...
+
+        async def flush(self) -> None:
+            """Wait until the server acknowledges all pending records."""
+            ...
+
+        async def close(self) -> None:
+            """Flush pending records and close the stream."""
+            ...
+
     class ZerobusSdk:
         """Main entry point for asynchronous Zerobus ingestion."""
 
-        def __init__(self, host: str, unity_catalog_url: str, application_name: Optional[str] = None) -> None:
+        async def open_persistent_stream(
+            self,
+            table_properties: TableProperties,
+            settings: PersistentStreamSettings,
+            resume_stream_id: Optional[str] = None,
+        ) -> "PersistentStream":
+            """Open a new persistent stream, or resume one when ``resume_stream_id`` is set."""
+            ...
+
+        def __init__(
+            self,
+            host: str,
+            unity_catalog_url: str,
+            application_name: Optional[str] = None,
+            connection_per_stream: bool = True,
+        ) -> None:
             """
             Create an asynchronous Zerobus SDK instance.
 
@@ -477,6 +684,8 @@ class aio:
                 application_name: Optional caller identifier (conventionally
                     "<product>/<version>") appended to the HTTP user-agent header on
                     gRPC requests toward the Zerobus server.
+                connection_per_stream: Whether each JSON/protobuf stream gets a
+                    dedicated gRPC connection. Defaults to True.
             """
             ...
 
@@ -531,6 +740,34 @@ class aio:
             """
             ...
 
+        async def create_stream_federated(
+            self,
+            table_properties: TableProperties,
+            idp_supplier: IdpSupplier,
+            databricks_client_id: Optional[str] = None,
+            options: Optional[StreamConfigurationOptions] = None,
+        ) -> "ZerobusStream":
+            """
+            Create a new stream with external-IdP federation (RFC 8693 token exchange).
+
+            Args:
+                table_properties: Table properties
+                idp_supplier: Short-lived supplier handle, rebuilt per create_stream
+                    (so it binds to this SDK's event loop and sync/async policy); the
+                    cache identity carried on the FederatedToken partitions the
+                    account-level token cache. The supplier carries a GC-visible
+                    holder for the callback (and any async context) that it references
+                    only weakly; the stream takes the sole retained strong reference,
+                    so a self-referential owner/stream/callback cycle stays collectable
+                databricks_client_id: Service principal client_id for workload
+                    identity federation, or None for account-level federation
+                options: Optional configuration options
+
+            Returns:
+                A new ZerobusStream
+            """
+            ...
+
         async def recreate_stream(self, old_stream: "ZerobusStream") -> "ZerobusStream":
             """
             Recreate a closed stream with the same configuration.
@@ -543,9 +780,7 @@ class aio:
             """
             ...
 
-# =============================================================================
-# ARROW (EXPERIMENTAL)
-# =============================================================================
+# Arrow Flight
 
 class arrow:
     """Arrow Flight support submodule."""
@@ -554,13 +789,13 @@ class arrow:
         """Arrow IPC compression codec."""
 
         NONE: "IPCCompression"
-        """No compression (default)."""
+        """No compression."""
 
         LZ4_FRAME: "IPCCompression"
         """LZ4 frame compression."""
 
         ZSTD: "IPCCompression"
-        """Zstandard compression."""
+        """Zstandard compression (default)."""
 
     class ArrowStreamConfigurationOptions:
         """Configuration options for Arrow Flight streams."""
@@ -590,7 +825,7 @@ class arrow:
         """Connection establishment timeout in milliseconds. Default: 30000"""
 
         ipc_compression: "arrow.IPCCompression"
-        """IPC compression codec. Default: IPCCompression.None"""
+        """IPC compression codec. Default: IPCCompression.ZSTD"""
 
         stream_paused_max_wait_time_ms: Optional[int]
         """Maximum ACK-wait cap during server-initiated graceful rotation.

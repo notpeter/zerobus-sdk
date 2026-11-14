@@ -1,5 +1,172 @@
 # Version changelog
 
+## Release v1.8.1
+
+### Major Changes
+
+### New Features and Improvements
+
+### Bug Fixes
+
+### Documentation
+
+- Built on Rust SDK 3.1.0. Wrapper-facing notes for that core are in
+  `rust/CHANGELOG.md` and https://github.com/databricks/zerobus-sdk/releases/tag/rust/v3.1.0.
+
+### Internal Changes
+
+- Bump `central-publishing-maven-plugin` from 0.11.0 to 0.12.0 so the Maven
+  Central deployment bundle no longer includes Maven 3.10 local-repository
+  files that caused Central to reject the upload.
+- Set the JNI crate version to 1.8.1 so the wire user-agent is
+  `zerobus-sdk-java/1.8.1`.
+
+### Breaking Changes
+
+### Deprecations
+
+### API Changes
+
+## Release v1.8.0
+
+### Major Changes
+
+### New Features and Improvements
+
+- Arrow Flight streams now compress IPC payloads with ZSTD by default.
+  `ArrowStreamConfigurationOptions.ipcCompression()` defaults to `IPCCompressionType.ZSTD` instead
+  of `IPCCompressionType.NONE`, and `setIpcCompression(null)` now resets it to that default. To keep
+  sending uncompressed payloads, pass `IPCCompressionType.NONE` to `ipcCompression(...)` or
+  `setIpcCompression(...)`.
+- Add Avro record format (Beta) via `streamBuilder().avro(schemaJson)`, producing a
+  `ZerobusAvroStream`. Ingest `GenericRecord` objects (encoded against the writer schema) or
+  pre-encoded Avro datums (`byte[]`), one at a time or in batches. Ingesting record objects requires
+  Java 11+ and the `org.apache.avro:avro` dependency (supplied by the caller, like `arrow-vector`);
+  the pre-encoded `byte[]` path and the rest of the SDK run on Java 8. A record's schema must match
+  the writer schema (field order and namespace matter; metadata is ignored), and encode failures are
+  non-retriable. See the README for the Java value each Avro type expects.
+
+### Bug Fixes
+
+### Documentation
+
+- Built on Rust SDK 3.0.0. Wrapper-facing notes for that core are in
+  `rust/CHANGELOG.md` and https://github.com/databricks/zerobus-sdk/releases/tag/rust/v3.0.0.
+  Rust 3.0.0 breaking changes (Arrow 60 type mixing, `tonic` types leaving the
+  public API, `TlsConfig`, generated gRPC types, and `EncodedBatch` storage)
+  do not change the Java public API.
+
+### Internal Changes
+
+- Set the JNI crate version to 1.8.0 so the wire user-agent is
+  `zerobus-sdk-java/1.8.0`.
+
+### Breaking Changes
+
+### Deprecations
+
+- `EncodedBatch(List<byte[]>, boolean)` — use `EncodedBatch(List<byte[]>, RecordFormat)` instead; the
+  boolean cannot represent the Avro format (it maps `false` to Protocol Buffers).
+
+### API Changes
+
+- New public API: `RecordFormat` enum; `EncodedBatch.getFormat()` and the
+  `EncodedBatch(List<byte[]>, RecordFormat)` constructor; and `ZerobusSdk.recreateStream(ZerobusAvroStream)`.
+
+## Release v1.7.0
+
+### Major Changes
+
+### New Features and Improvements
+
+- JSON and protobuf streams now use a dedicated gRPC connection by default.
+  New `ZerobusSdk` constructor overloads accept a `connectionPerStream`
+  boolean; pass `false` to share one HTTP/2 connection across streams.
+
+### Bug Fixes
+
+### Documentation
+
+- Built on Rust SDK 2.9.0. Wrapper-facing notes for that core are in
+  `rust/CHANGELOG.md` and https://github.com/databricks/zerobus-sdk/releases/tag/rust/v2.9.0.
+
+### Internal Changes
+
+### Breaking Changes
+
+### Deprecations
+
+### API Changes
+
+## Release v1.6.0
+
+### Major Changes
+
+### New Features and Improvements
+
+- Promoted Arrow Flight ingestion to general availability across its APIs,
+  documentation, and examples.
+
+### Bug Fixes
+
+### Documentation
+
+- Built on Rust SDK 2.8.0. Wrapper-facing notes for that core are in
+  `rust/CHANGELOG.md` and https://github.com/databricks/zerobus-sdk/releases/tag/rust/v2.8.0.
+
+### Internal Changes
+
+### Breaking Changes
+
+### Deprecations
+
+### API Changes
+
+## Release v1.5.0
+
+### Major Changes
+
+### New Features and Improvements
+
+### Bug Fixes
+
+### Documentation
+
+- Updated dependency snippets to version 1.4.0 and corrected README and example
+  code for stream cleanup, recreation, unique local variables, and a single
+  durability barrier after queued ingestion. Clarified that acknowledgment
+  callbacks fire once per logical ingest submission, including one callback per
+  batch ingest call.
+- Documented that published JARs support Java 8 while source builds need JDK 11,
+  that macOS JNI artifacts are not in the current release set, that
+  `recoveryRetries` defaults to 4, and that `flush()` waits for durability rather
+  than callback completion.
+- Maven Central snippets no longer tell users to redeclare compile-scope
+  transitives (`protobuf-java`, `slf4j-api`). Stream-builder examples use
+  try-with-resources. GenerateProto docs no longer claim STRUCT support, JAR
+  examples use `zerobus-ingest-sdk` 1.4.0, and proto examples generate
+  `AirQualityProto.java` with `protoc` instead of treating it as checked in.
+  Example README snippets and the JSON/proto `SingleRecordExample` programs
+  queue records or batches and call `flush()` once instead of
+  `waitForOffset()` after a single ingest.
+- Built on Rust SDK 2.7.1. Wrapper-facing notes for that core are in
+  `rust/CHANGELOG.md` and https://github.com/databricks/zerobus-sdk/releases/tag/rust/v2.7.1.
+
+### Internal Changes
+
+- Bumped `central-publishing-maven-plugin` from 0.5.0 to 0.11.0 so Maven Central
+  deploy can parse the Portal status response that now includes a `warnings` field.
+  0.5.0 crashed after a successful upload, which made the publisher job look failed
+  even when the bundle was already in the Portal.
+- The JNI and Java release workflows can optionally import laptop-built macOS
+  dylibs from a GitHub Release when CI has no macOS runners.
+
+### Breaking Changes
+
+### Deprecations
+
+### API Changes
+
 ## Release v1.4.0
 
 ### New Features and Improvements

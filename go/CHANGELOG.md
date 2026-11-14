@@ -1,5 +1,94 @@
 # Version changelog
 
+## Release v1.8.0
+
+### New Features and Improvements
+
+### Deprecations
+
+### Bug Fixes
+
+### Documentation
+
+- Built on Rust SDK 3.0.0. Wrapper-facing notes for that core are in
+  `rust/CHANGELOG.md` and https://github.com/databricks/zerobus-sdk/releases/tag/rust/v3.0.0.
+  Rust 3.0.0 breaking changes (Arrow 60 type mixing, `tonic` types leaving the
+  public API, `TlsConfig`, generated gRPC types, and `EncodedBatch` storage)
+  do not change the Go public API.
+
+### Internal Changes
+
+- Set `sdkVersion` to `1.8.0` so the wire user-agent matches this tag.
+
+### API Changes
+
+## Release v1.7.0
+
+### New Features and Improvements
+
+- JSON and protobuf streams now use a dedicated gRPC connection by default.
+  Pass `WithConnectionPerStream(false)` to `NewZerobusSdkWithOptions` to share
+  one HTTP/2 connection across streams.
+
+### Deprecations
+
+### Bug Fixes
+
+### Documentation
+
+- Built on Rust SDK 2.9.0. Wrapper-facing notes for that core are in
+  `rust/CHANGELOG.md` and https://github.com/databricks/zerobus-sdk/releases/tag/rust/v2.9.0.
+
+### Internal Changes
+
+### API Changes
+
+## Release v1.6.0
+
+### New Features and Improvements
+
+- Promoted Arrow Flight ingestion to general availability across its APIs,
+  documentation, and examples.
+
+### Deprecations
+
+### Bug Fixes
+
+### Documentation
+
+- Built on Rust SDK 2.8.0. Wrapper-facing notes for that core are in
+  `rust/CHANGELOG.md` and https://github.com/databricks/zerobus-sdk/releases/tag/rust/v2.8.0.
+
+### Internal Changes
+
+### API Changes
+
+## Release v1.5.0
+
+### New Features and Improvements
+
+### Deprecations
+
+### Bug Fixes
+
+### Documentation
+
+- Corrected consumer installation so tagged releases do not require Rust or
+  `go generate`. Documented that `make build-go` depends on the Rust FFI build.
+- Documented that `GetUnackedRecords()` must run before `Close()`, that
+  `RecordAck.Await()` waits for server durability, and that one stream can be
+  used from multiple goroutines.
+- Added `Flush()` to copyable example snippets.
+- Batch examples name the offset returned by `IngestRecordsOffset` `batchOffset`.
+  Example and test modules keep the CI toolchain Go versions; the documented
+  SDK minimum remains Go 1.21+.
+- Built on Rust SDK 2.7.1. Wrapper-facing notes for that core are in
+  `rust/CHANGELOG.md` and https://github.com/databricks/zerobus-sdk/releases/tag/rust/v2.7.1.
+
+### Internal Changes
+
+### API Changes
+
 ## Release v1.4.0
 
 ### Bug Fixes

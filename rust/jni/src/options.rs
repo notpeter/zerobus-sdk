@@ -4,13 +4,12 @@
 //! then applied to a `StreamBuilder` inside the async task that builds the stream.
 
 use crate::callbacks::JavaAckCallback;
-use arrow_ipc::CompressionType;
-use databricks_zerobus_ingest_sdk::{AckCallback, StreamBuilder};
+use databricks_zerobus_ingest_sdk::{AckCallback, ArrowCompression, StreamBuilder};
 use jni::objects::JObject;
 use jni::JNIEnv;
 use std::sync::Arc;
 
-/// Extracted gRPC stream options, ready to apply to a `StreamBuilder`.
+/// Extracted JSON/protobuf stream options, ready to apply to a `StreamBuilder`.
 pub struct ExtractedStreamOptions {
     pub max_inflight_requests: usize,
     pub recovery: bool,
@@ -32,11 +31,11 @@ pub struct ExtractedArrowStreamOptions {
     pub server_lack_of_ack_timeout_ms: u64,
     pub flush_timeout_ms: u64,
     pub connection_timeout_ms: u64,
-    pub ipc_compression: Option<CompressionType>,
+    pub compression: ArrowCompression,
     pub stream_paused_max_wait_time_ms: Option<u64>,
 }
 
-/// Read gRPC stream options from a Java options object.
+/// Read JSON/protobuf stream options from a Java options object.
 pub fn extract_stream_options(
     env: &mut JNIEnv,
     options: &JObject,
@@ -65,7 +64,7 @@ pub fn extract_stream_options(
     })
 }
 
-/// Apply extracted gRPC stream options to a builder.
+/// Apply extracted JSON/protobuf stream options to a builder.
 pub fn apply_stream_options<'a>(
     builder: StreamBuilder<'a>,
     opts: ExtractedStreamOptions,
@@ -136,10 +135,10 @@ pub fn extract_arrow_stream_options(
         .call_method(&compression_enum, "name", "()Ljava/lang/String;", &[])?
         .l()?;
     let compression_name: String = env.get_string((&compression_jstring).into())?.into();
-    let ipc_compression = match compression_name.as_str() {
-        "LZ4_FRAME" => Some(CompressionType::LZ4_FRAME),
-        "ZSTD" => Some(CompressionType::ZSTD),
-        _ => None,
+    let compression = match compression_name.as_str() {
+        "LZ4_FRAME" => ArrowCompression::IpcLz4,
+        "ZSTD" => ArrowCompression::IpcZstd,
+        _ => ArrowCompression::Uncompressed,
     };
 
     let stream_paused_max_wait_time_raw = env
@@ -174,7 +173,7 @@ pub fn extract_arrow_stream_options(
         connection_timeout_ms: env
             .call_method(options, "connectionTimeoutMs", "()J", &[])?
             .j()? as u64,
-        ipc_compression,
+        compression,
         stream_paused_max_wait_time_ms,
     })
 }
@@ -193,6 +192,6 @@ pub fn apply_arrow_stream_options<'a>(
         .server_lack_of_ack_timeout_ms(opts.server_lack_of_ack_timeout_ms)
         .flush_timeout_ms(opts.flush_timeout_ms)
         .connection_timeout_ms(opts.connection_timeout_ms)
-        .ipc_compression(opts.ipc_compression)
+        .compression(opts.compression)
         .stream_paused_max_wait_time_ms(opts.stream_paused_max_wait_time_ms)
 }

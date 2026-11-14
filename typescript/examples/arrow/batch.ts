@@ -1,5 +1,5 @@
 /**
- * Arrow Flight ingestion example (Beta).
+ * Arrow Flight ingestion example.
  *
  * Opens one Arrow Flight stream, ingests 10 batches (5 rows each) in a
  * loop, waits for the last offset to be acknowledged, flushes, and
@@ -34,15 +34,13 @@ import {
     ArrowTableProperties,
     ZerobusSdk,
 } from '../../index';
+import { requiredEnv } from '../config';
 
-const SERVER_ENDPOINT =
-    process.env.ZEROBUS_SERVER_ENDPOINT ||
-    'https://your-workspace-id.zerobus.region.cloud.databricks.com';
-const DATABRICKS_WORKSPACE_URL =
-    process.env.DATABRICKS_WORKSPACE_URL || 'https://your-workspace.cloud.databricks.com';
-const TABLE_NAME = process.env.ZEROBUS_TABLE_NAME || 'catalog.schema.table';
-const CLIENT_ID = process.env.DATABRICKS_CLIENT_ID || 'your-client-id';
-const CLIENT_SECRET = process.env.DATABRICKS_CLIENT_SECRET || 'your-client-secret';
+const SERVER_ENDPOINT = requiredEnv('ZEROBUS_SERVER_ENDPOINT');
+const WORKSPACE_URL = requiredEnv('DATABRICKS_WORKSPACE_URL');
+const TABLE_NAME = requiredEnv('ZEROBUS_TABLE_NAME');
+const CLIENT_ID = requiredEnv('DATABRICKS_CLIENT_ID');
+const CLIENT_SECRET = requiredEnv('DATABRICKS_CLIENT_SECRET');
 
 const SCHEMA = new Schema([
     new Field('device_name', new Utf8(), true),
@@ -71,10 +69,10 @@ function buildBatchIpc(batchIndex: number, rowsPerBatch: number): Buffer {
 }
 
 async function main() {
-    console.log('Arrow Flight Example (Beta)');
+    console.log('Arrow Flight Example');
     console.log('='.repeat(60));
 
-    const sdk = new ZerobusSdk(SERVER_ENDPOINT, DATABRICKS_WORKSPACE_URL);
+    const sdk = new ZerobusSdk(SERVER_ENDPOINT, WORKSPACE_URL);
 
     const tableProperties: ArrowTableProperties = {
         tableName: TABLE_NAME,

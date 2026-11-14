@@ -7,7 +7,8 @@ This directory contains examples demonstrating how to use the Zerobus Rust SDK t
 - [Overview](#overview)
 - [JSON Examples](json/README.md)
 - [Protocol Buffers Examples](proto/README.md)
-- [Arrow Flight Examples](arrow/README.md) (Beta)
+- [Arrow Flight Examples](arrow/README.md)
+- [Avro Examples](avro/README.md)
 - [Prerequisites](#prerequisites)
   - [Create a Databricks Table](#1-create-a-databricks-table)
   - [Set Up OAuth Service Principal](#2-set-up-oauth-service-principal)
@@ -20,16 +21,17 @@ This directory contains examples demonstrating how to use the Zerobus Rust SDK t
 
 ## Overview
 
-The SDK supports two serialization formats and two ingestion methods:
+The SDK supports four ingestion formats and two ingestion methods:
 
 **Serialization Formats:**
 - **[JSON](json/README.md)** - Simpler, no schema generation required. Great for getting started.
 - **[Protocol Buffers](proto/README.md)** - Type-safe with compile-time validation. Better for production.
-- **[Arrow Flight](arrow/README.md)** (Beta) - Columnar Arrow `RecordBatch` ingestion over Arrow Flight. Behind the `arrow-flight` feature flag.
+- **[Arrow Flight](arrow/README.md)** - Columnar Arrow `RecordBatch` ingestion over Arrow Flight. Behind the `arrow-flight` feature flag.
+- **[Avro](avro/README.md)** - Row-oriented binary encoding driven by a writer schema. Build records as `AvroValue` the stream encodes (`AvroRecord`), or pass pre-encoded datums (`AvroBytes`). Behind the `avro` feature flag (Beta).
 
 **Ingestion Methods:**
-- **Single-record** (`ingest_record_offset`) - Ingest records one at a time (JSON / Protocol Buffers)
-- **Batch** (`ingest_records_offset`) - Ingest multiple records at once with all-or-nothing semantics (JSON / Protocol Buffers)
+- **Single-record** (`ingest_record_offset`) - Ingest records one at a time (JSON / Protocol Buffers / Avro)
+- **Batch** (`ingest_records_offset`) - Ingest multiple records at once with all-or-nothing semantics (JSON / Protocol Buffers / Avro)
 - **Arrow batch** (`ingest_batch` / `ingest_ipc_batch`) - Ingest an Arrow `RecordBatch` (one or many rows) over Arrow Flight
 
 **Available Examples:**
@@ -38,11 +40,17 @@ The SDK supports two serialization formats and two ingestion methods:
 |---------|--------|--------|----------|
 | [JSON Single](json/README.md#single-record-example) | JSON | Single-record | `cargo run -p rust-examples-json --example json_single` |
 | [JSON Batch](json/README.md#batch-example) | JSON | Batch | `cargo run -p rust-examples-json --example json_batch` |
+| [JSON Persistent](json/README.md#persistent-stream-example) | JSON | Persistent create/resume | `cargo run -p rust-examples-json --example json_persistent` |
 | [Proto Compiled Single](proto/README.md#compiled-single-record-example) | Protocol Buffers | Single-record | `cargo run -p rust-examples-proto --example proto_compiled_single` |
 | [Proto Compiled Batch](proto/README.md#compiled-batch-example) | Protocol Buffers | Batch | `cargo run -p rust-examples-proto --example proto_compiled_batch` |
+| [Proto Multiplexed](proto/README.md#multiplexed-stream-example) | Protocol Buffers | Multiplexed | `cargo run -p rust-examples-proto --example proto_compiled_multiplexed` |
 | [Proto Dynamic](proto/README.md#dynamic-schema-example) | Protocol Buffers | Single-record (runtime schema) | `cargo run -p rust-examples-proto --example proto_dynamic_single` |
 | [Proto Dynamic Batch](proto/README.md#dynamic-batch) | Protocol Buffers | Batch (runtime schema) | `cargo run -p rust-examples-proto --example proto_dynamic_batch` |
-| [Arrow](arrow/README.md) | Arrow Flight (Beta) | `RecordBatch` | `cargo run -p example_arrow` |
+| [Arrow](arrow/README.md) | Arrow Flight | `RecordBatch` | `cargo run -p example_arrow` |
+| [Arrow Multiplexed](arrow/README.md#multiplexed-arrow-flight) | Arrow Flight | Multiplexed | `cargo run -p example_arrow --example arrow_multiplexed` |
+| [Avro Single](avro/README.md#single-record-example) | Avro | Single-record | `cd avro && cargo run --example avro_single` |
+| [Avro Batch](avro/README.md#batch-example) | Avro | Batch | `cd avro && cargo run --example avro_batch` |
+| [Avro Multiplexed](avro/README.md#multiplexed-example) | Avro | Multiplexed | `cd avro && cargo run --example avro_multiplexed` |
 
 ## Prerequisites
 
@@ -77,22 +85,20 @@ Replace `catalog.schema.orders` with your actual catalog, schema, and table name
 
 ### 3. Configure Credentials
 
-Edit the source file (`batch.rs` or `single.rs`) for your chosen example and update these constants:
+Every example reads its connection settings and credentials from environment variables
+through the shared [`config.rs`](config.rs) helper. Use the [connection URL table](https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id)
+to find the values for your cloud, then export:
 
-```rust
-const DATABRICKS_WORKSPACE_URL: &str = "https://your-workspace.cloud.databricks.com";
-const TABLE_NAME: &str = "catalog.schema.orders";
-const DATABRICKS_CLIENT_ID: &str = "your-client-id";
-const DATABRICKS_CLIENT_SECRET: &str = "your-client-secret";
-const SERVER_ENDPOINT: &str = "https://workspace-id.zerobus.region.cloud.databricks.com";
+```bash
+export ZEROBUS_SERVER_ENDPOINT="<your-zerobus-server-endpoint>"
+export DATABRICKS_WORKSPACE_URL="<your-databricks-workspace-url>"
+export ZEROBUS_TABLE_NAME="catalog.schema.orders"
+export DATABRICKS_CLIENT_ID="<your-oauth-client-id>"
+export DATABRICKS_CLIENT_SECRET="<your-oauth-client-secret>"
 ```
 
-**How to get these values:**
-- **DATABRICKS_WORKSPACE_URL** - Your Databricks workspace URL (Unity Catalog endpoint)
-- **TABLE_NAME** - Full table name in format `catalog.schema.table`
-- **DATABRICKS_CLIENT_ID** - OAuth 2.0 client ID from your service principal
-- **DATABRICKS_CLIENT_SECRET** - OAuth 2.0 client secret from your service principal
-- **SERVER_ENDPOINT** - Zerobus ingestion endpoint (usually `https://<workspace-id>.zerobus.<region>.databricks.com`)
+`ZEROBUS_TABLE_NAME` is the full table name in `catalog.schema.table` form. The
+client ID and secret are the OAuth credentials for the service principal.
 
 ## Common Code Patterns
 
@@ -102,8 +108,8 @@ All examples follow the same general flow:
 
 ```rust
 let sdk = ZerobusSdk::builder()
-    .endpoint(SERVER_ENDPOINT)
-    .unity_catalog_url(DATABRICKS_WORKSPACE_URL)
+    .endpoint(&config.server_endpoint)
+    .unity_catalog_url(&config.workspace_url)
     .build()?;
 ```
 
@@ -113,8 +119,8 @@ let sdk = ZerobusSdk::builder()
 ```rust
 let mut stream = sdk
     .stream_builder()
-    .table(TABLE_NAME)
-    .oauth(DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET)
+    .table(&config.table_name)
+    .oauth(&config.client_id, &config.client_secret)
     .json()
     .max_inflight_requests(100)
     .build()
@@ -131,15 +137,15 @@ let descriptor_proto = load_descriptor_proto(
 
 let mut stream = sdk
     .stream_builder()
-    .table(TABLE_NAME)
-    .oauth(DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET)
+    .table(&config.table_name)
+    .oauth(&config.client_id, &config.client_secret)
     .compiled_proto(descriptor_proto)
     .max_inflight_requests(100)
     .build()
     .await?;
 ```
 
-**Arrow Flight (Beta):**
+**Arrow Flight:**
 ```rust
 use std::sync::Arc;
 use databricks_zerobus_ingest_sdk::{ArrowSchema, DataType, Field};
@@ -152,8 +158,8 @@ let schema = Arc::new(ArrowSchema::new(vec![
 
 let mut stream = sdk
     .stream_builder()
-    .table(TABLE_NAME)
-    .oauth(DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET)
+    .table(&config.table_name)
+    .oauth(&config.client_id, &config.client_secret)
     .arrow(schema)
     .max_inflight_batches(100)
     .build_arrow()
@@ -266,9 +272,9 @@ if let Some(offset) = stream.ingest_records_offset(records).await? {
 
 **Possible causes:**
 - OAuth credentials expired or invalid
-- Incorrect Unity Catalog endpoint
+- Incorrect workspace URL
 
-**Solution:** Regenerate your service principal credentials and verify the endpoint URL.
+**Solution:** Regenerate your service principal credentials and verify the workspace URL.
 
 ### Error: JSON parsing errors (JSON example only)
 

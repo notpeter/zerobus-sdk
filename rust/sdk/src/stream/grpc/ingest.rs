@@ -7,11 +7,12 @@
 
 use std::future::Future;
 use std::sync::atomic::Ordering;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use super::types::IngestRequest;
 use super::ZerobusStream;
-use crate::{EncodedBatch, EncodedRecord, OffsetId, ZerobusError, ZerobusResult};
+use crate::grpc_status::GrpcStatus;
+use crate::{EncodedBatch, EncodedRecord, OffsetId, PreparedInput, ZerobusError, ZerobusResult};
 
 impl ZerobusStream {
     /// Ingests a single record and returns its logical offset directly.
@@ -21,7 +22,7 @@ impl ZerobusStream {
     ///
     /// # Arguments
     ///
-    /// * `payload` - A record that can be converted to `EncodedRecord` (either JSON string or protobuf bytes)
+    /// * `payload` - The record to ingest, as a record wrapper or raw payload matching the stream's format
     ///
     /// # Returns
     ///
@@ -50,16 +51,10 @@ impl ZerobusStream {
     /// ```
     pub async fn ingest_record_offset(
         &self,
-        payload: impl Into<EncodedRecord>,
+        payload: impl Into<PreparedInput>,
     ) -> ZerobusResult<OffsetId> {
-        let encoded_batch = EncodedBatch::try_from_record(payload, self.options.record_type)
-            .ok_or_else(|| {
-                ZerobusError::InvalidArgument(
-                    "Record type does not match stream configuration".to_string(),
-                )
-            })?;
-
-        self.ingest_internal_v2(encoded_batch).await
+        let encoded_batch = self.prepare_record(payload)?;
+        self.enqueue_prepared_batch(encoded_batch).await
     }
 
     /// Ingests a batch of records and returns the logical offset directly.
@@ -69,7 +64,7 @@ impl ZerobusStream {
     ///
     /// # Arguments
     ///
-    /// * `payload` - An iterator of records (each item should be convertible to `EncodedRecord`)
+    /// * `payload` - An iterator of records to ingest, each a record wrapper or raw payload matching the stream's format
     ///
     /// # Returns
     ///
@@ -100,22 +95,103 @@ impl ZerobusStream {
     pub async fn ingest_records_offset<I, T>(&self, payload: I) -> ZerobusResult<Option<OffsetId>>
     where
         I: IntoIterator<Item = T>,
-        T: Into<EncodedRecord>,
+        T: Into<PreparedInput>,
     {
-        let encoded_batch = EncodedBatch::try_from_batch(payload, self.options.record_type)
+        let encoded_batch = self.prepare_records(payload)?;
+
+        if encoded_batch.is_empty() {
+            Ok(None)
+        } else {
+            self.enqueue_prepared_batch(encoded_batch)
+                .await
+                .map(Option::Some)
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn prepare_record(
+        &self,
+        payload: impl Into<PreparedInput>,
+    ) -> ZerobusResult<EncodedBatch> {
+        let encoded_record = self.encode_prepared(payload.into())?;
+        let encoded_batch = EncodedBatch::try_from_record(encoded_record, self.options.record_type)
             .ok_or_else(|| {
                 ZerobusError::InvalidArgument(
                     "Record type does not match stream configuration".to_string(),
                 )
             })?;
+        self.validate_ingest_payload(&encoded_batch)?;
+        Ok(encoded_batch)
+    }
 
-        if encoded_batch.is_empty() {
-            Ok(None)
-        } else {
-            self.ingest_internal_v2(encoded_batch)
-                .await
-                .map(Option::Some)
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn prepare_records<I, T>(&self, payload: I) -> ZerobusResult<EncodedBatch>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<PreparedInput>,
+    {
+        let encoded_batch = EncodedBatch::try_from_encoded_iter(
+            payload
+                .into_iter()
+                .map(|rec| self.encode_prepared(rec.into())),
+            self.options.record_type,
+        )?;
+        self.validate_ingest_payload(&encoded_batch)?;
+        Ok(encoded_batch)
+    }
+
+    /// Turns a [`PreparedInput`] into an [`EncodedRecord`]. Only the deferred Avro-object
+    /// path needs the stream's writer schema; every other payload is already encoded.
+    #[allow(clippy::result_large_err)]
+    fn encode_prepared(&self, prepared: PreparedInput) -> ZerobusResult<EncodedRecord> {
+        match prepared {
+            PreparedInput::Ready(record) => Ok(record),
+            #[cfg(feature = "avro")]
+            PreparedInput::AvroObject(value) => {
+                if self.options.record_type != crate::RecordType::Avro {
+                    return Err(ZerobusError::InvalidArgument(
+                        "AvroRecord requires stream record type to be Avro".to_string(),
+                    ));
+                }
+                let schema = self.table_properties.avro_schema.as_ref().ok_or_else(|| {
+                    ZerobusError::InvalidArgument(
+                        "Avro schema required but not provided in stream configuration".to_string(),
+                    )
+                })?;
+                let datum = value
+                    .resolve(&schema.parsed)
+                    .and_then(|resolved| {
+                        apache_avro::writer::datum::GenericDatumWriter::builder(&schema.parsed)
+                            .build()?
+                            .write_value_to_vec(resolved)
+                    })
+                    .map_err(|e| ZerobusError::AvroEncodingError(e.to_string()))?;
+                Ok(EncodedRecord::Avro(datum))
+            }
         }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn validate_ingest_payload(&self, encoded_batch: &EncodedBatch) -> ZerobusResult<()> {
+        let byte_size = encoded_batch.total_byte_size();
+        let max_payload_bytes = self.options.max_ingest_payload_bytes;
+        if byte_size > max_payload_bytes {
+            return Err(ZerobusError::InvalidArgument(format!(
+                "Ingest payload too large: {byte_size} bytes exceeds the configured limit of {max_payload_bytes} bytes"
+            )));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn check_open(&self) -> ZerobusResult<()> {
+        if self.is_closed.load(Ordering::Relaxed) {
+            error!(table_name = %self.table_properties.table_name, "Stream closed");
+            return Err(ZerobusError::StreamClosedError(GrpcStatus::internal(
+                "Stream closed",
+            )));
+        }
+        Ok(())
     }
 
     /// Internal unified method for ingesting records and batches.
@@ -126,72 +202,76 @@ impl ZerobusStream {
         &self,
         encoded_batch: EncodedBatch,
     ) -> ZerobusResult<impl Future<Output = ZerobusResult<OffsetId>>> {
-        if self.is_closed.load(Ordering::Relaxed) {
-            error!(table_name = %self.table_properties.table_name, "Stream closed");
-            return Err(ZerobusError::StreamClosedError(tonic::Status::internal(
-                "Stream closed",
-            )));
-        }
-
-        let _guard = self.sync_mutex.lock().await;
-
-        let offset_id = self.logical_offset_id_generator.next();
-        debug!(
-            offset_id = offset_id,
-            record_count = encoded_batch.get_record_count(),
-            "Ingesting record(s)"
-        );
-
-        if let Some(stream_id) = self.stream_id.as_ref() {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            {
-                let mut map = self.oneshot_map.lock().await;
-                map.insert(offset_id, tx);
-            }
-            self.landing_zone
-                .add(Box::new(IngestRequest {
-                    payload: encoded_batch,
-                    offset_id,
-                }))
-                .await;
-            let stream_id = stream_id.to_string();
-            Ok(async move {
-                rx.await.map_err(|err| {
-                    error!(stream_id = %stream_id, "Failed to receive ack: {}", err);
-                    ZerobusError::StreamClosedError(tonic::Status::internal(
-                        "Failed to receive ack",
-                    ))
-                })?
-            })
-        } else {
-            error!("Stream ID is None");
-            Err(ZerobusError::StreamClosedError(tonic::Status::internal(
-                "Stream ID is None",
-            )))
-        }
+        let reservation = self.reserve_capacity().await?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (_, stream_id) = self
+            .enqueue_reserved_with(
+                encoded_batch,
+                reservation,
+                || Ok(()),
+                |offset_id| async move {
+                    let Some(stream_id) = self.stream_id.as_ref() else {
+                        error!("Stream ID is None");
+                        return Err(ZerobusError::StreamClosedError(GrpcStatus::internal(
+                            "Stream ID is None",
+                        )));
+                    };
+                    self.oneshot_map.lock().await.insert(offset_id, tx);
+                    Ok(stream_id.clone())
+                },
+            )
+            .await?;
+        Ok(async move {
+            rx.await.map_err(|err| {
+                error!(stream_id = %stream_id, "Failed to receive ack: {}", err);
+                ZerobusError::StreamClosedError(GrpcStatus::internal("Failed to receive ack"))
+            })?
+        })
     }
 
     /// Internal unified method for ingesting records and batches.
     ///
     /// Returns the logical offset directly without waiting for acknowledgment.
     /// Used by the public `ingest_*_offset` methods.
-    async fn ingest_internal_v2(&self, encoded_batch: EncodedBatch) -> ZerobusResult<OffsetId> {
-        let byte_size = encoded_batch.total_byte_size();
-        let max_payload_bytes = self.options.max_ingest_payload_bytes;
-        if byte_size > max_payload_bytes {
-            return Err(ZerobusError::InvalidArgument(format!(
-                "Ingest payload too large: {byte_size} bytes exceeds the configured limit of {max_payload_bytes} bytes"
-            )));
-        }
+    async fn enqueue_prepared_batch(&self, encoded_batch: EncodedBatch) -> ZerobusResult<OffsetId> {
+        let reservation = self.reserve_capacity().await?;
+        self.enqueue_reserved_admitted(encoded_batch, reservation, || Ok(()))
+            .await
+    }
 
-        if self.is_closed.load(Ordering::Relaxed) {
-            error!(table_name = %self.table_properties.table_name, "Stream closed");
-            return Err(ZerobusError::StreamClosedError(tonic::Status::internal(
-                "Stream closed",
-            )));
-        }
+    /// Assign and enqueue under the lifecycle lock after checking mux admission.
+    pub(crate) async fn enqueue_reserved_admitted<F>(
+        &self,
+        encoded_batch: EncodedBatch,
+        reservation: crate::landing_zone::CapacityReservation,
+        admit: F,
+    ) -> ZerobusResult<OffsetId>
+    where
+        F: FnOnce() -> ZerobusResult<()>,
+    {
+        let (offset_id, ()) = self
+            .enqueue_reserved_with(encoded_batch, reservation, admit, |_| async { Ok(()) })
+            .await?;
+        Ok(offset_id)
+    }
 
+    /// The offset hook runs before enqueue while the lifecycle lock is held.
+    /// `ingest_internal` uses it to register its acknowledgment waiter.
+    async fn enqueue_reserved_with<F, H, Fut, R>(
+        &self,
+        encoded_batch: EncodedBatch,
+        reservation: crate::landing_zone::CapacityReservation,
+        admit: F,
+        on_offset: H,
+    ) -> ZerobusResult<(OffsetId, R)>
+    where
+        F: FnOnce() -> ZerobusResult<()>,
+        H: FnOnce(OffsetId) -> Fut,
+        Fut: Future<Output = ZerobusResult<R>>,
+    {
         let _guard = self.sync_mutex.lock().await;
+        admit()?;
+        self.check_open()?;
 
         let offset_id = self.logical_offset_id_generator.next();
         debug!(
@@ -199,17 +279,47 @@ impl ZerobusStream {
             record_count = encoded_batch.get_record_count(),
             "Ingesting record(s)"
         );
-        self.landing_zone
-            .add(Box::new(IngestRequest {
+        let hook_result = on_offset(offset_id).await?;
+        self.landing_zone.enqueue_reserved(
+            Box::new(IngestRequest {
                 payload: encoded_batch,
                 offset_id,
-            }))
-            .await;
-        Ok(offset_id)
+            }),
+            reservation,
+        );
+        Ok((offset_id, hook_result))
     }
 
-    #[cfg(feature = "testing")]
-    pub(crate) fn has_capacity(&self) -> bool {
-        self.landing_zone.len() < self.options.max_inflight_requests
+    pub(crate) async fn reserve_capacity(
+        &self,
+    ) -> ZerobusResult<crate::landing_zone::CapacityReservation> {
+        self.check_open()?;
+        let started_at = tokio::time::Instant::now();
+        let table_name = self.table_properties.table_name.as_str();
+        let max_inflight_requests = self.options.max_inflight_requests;
+        tokio::select! {
+            reservation = self.landing_zone.reserve_capacity() => Ok(reservation),
+            _ = self.terminal_token.cancelled() => {
+                let waited_ms = started_at.elapsed().as_millis();
+                let cause = self
+                    .server_error_rx
+                    .borrow()
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "stream closed without a recorded server error".to_string());
+                warn!(
+                    table_name,
+                    waited_ms,
+                    max_inflight_requests,
+                    cause,
+                    "Stream capacity wait cancelled by terminal shutdown"
+                );
+                Err(ZerobusError::StreamClosedError(GrpcStatus::internal(
+                    format!(
+                        "Stream for table {table_name} terminated after {waited_ms} ms while waiting for capacity (max_inflight_requests: {max_inflight_requests}; cause: {cause})"
+                    ),
+                )))
+            }
+        }
     }
 }

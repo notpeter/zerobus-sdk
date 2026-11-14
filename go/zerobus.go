@@ -20,8 +20,8 @@
 // Create an SDK instance and stream:
 //
 //	sdk, err := zerobus.NewZerobusSdkWithOptions(
-//	    "https://your-shard.zerobus.databricks.com",
-//	    "https://your-workspace.databricks.com",
+//	    serverEndpoint,
+//	    workspaceURL,
 //	    zerobus.WithApplicationName("my-app/1.0"),
 //	)
 //	if err != nil {
@@ -146,14 +146,15 @@ type ZerobusSdk struct {
 	ptr unsafe.Pointer
 }
 
-// ZerobusStream represents an active bidirectional gRPC stream for ingesting records.
+// ZerobusStream represents an active JSON or Protocol Buffer stream for ingesting records.
 // Records can be ingested concurrently and will be acknowledged asynchronously.
 type ZerobusStream struct {
 	ptr unsafe.Pointer
 }
 
 type sdkOptions struct {
-	applicationName string
+	applicationName     string
+	connectionPerStream *bool
 }
 
 // SdkOption configures a ZerobusSdk created with NewZerobusSdkWithOptions.
@@ -174,22 +175,37 @@ func WithApplicationName(name string) SdkOption {
 	}
 }
 
+// WithConnectionPerStream controls whether every JSON/protobuf ingestion
+// stream receives a dedicated gRPC connection. It is enabled by default. Pass
+// false to multiplex all streams created by the SDK over one shared HTTP/2
+// connection.
+func WithConnectionPerStream(enabled bool) SdkOption {
+	return func(options *sdkOptions) {
+		options.connectionPerStream = &enabled
+	}
+}
+
 // NewZerobusSdk creates a new SDK instance.
 //
 // Parameters:
-//   - zerobusEndpoint: The gRPC endpoint for the Zerobus service (e.g., "https://zerobus.databricks.com")
-//   - unityCatalogURL: The Unity Catalog URL for OAuth token acquisition (e.g., "https://workspace.databricks.com")
+//   - zerobusEndpoint: The gRPC endpoint for the Zerobus service
+//   - unityCatalogURL: The Databricks workspace URL for OAuth token acquisition
+//
+// See the [connection URL table] for cloud-specific formats.
 //
 // Returns an error if:
 //   - Invalid endpoint URLs
-//   - Unable to extract workspace ID from Unity Catalog URL
+//   - Unable to extract workspace ID from the Zerobus endpoint
+//
+// [connection URL table]: https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id
 func NewZerobusSdk(zerobusEndpoint, unityCatalogURL string) (*ZerobusSdk, error) {
 	return newZerobusSdk(zerobusEndpoint, unityCatalogURL, sdkOptions{})
 }
 
 // NewZerobusSdkWithOptions creates an SDK instance with optional settings.
 // Use WithApplicationName to add an application identifier to the user-agent
-// header sent on every Zerobus request.
+// header sent on every Zerobus request. Use WithConnectionPerStream(false) to
+// opt into sharing one connection; dedicated connections are the default.
 //
 // Application names are trimmed before use, and blank values are ignored.
 // Invalid UTF-8, NUL bytes, and values that are invalid in an HTTP header cause
@@ -201,8 +217,8 @@ func NewZerobusSdk(zerobusEndpoint, unityCatalogURL string) (*ZerobusSdk, error)
 // Example:
 //
 //	sdk, err := zerobus.NewZerobusSdkWithOptions(
-//	    "https://workspace.zerobus.databricks.com",
-//	    "https://workspace.cloud.databricks.com",
+//	    serverEndpoint,
+//	    workspaceURL,
 //	    zerobus.WithApplicationName("my-app/1.0"),
 //	)
 func NewZerobusSdkWithOptions(
@@ -262,7 +278,7 @@ func (s *ZerobusSdk) Free() {
 	}
 }
 
-// CreateStream creates a new bidirectional gRPC stream for ingesting records into a Databricks table.
+// CreateStream creates a new JSON or Protocol Buffer stream for ingesting records into a Databricks table.
 // This method uses OAuth 2.0 client credentials flow for authentication.
 //
 // Parameters:
@@ -346,7 +362,7 @@ type HeadersProvider interface {
 	GetHeaders() (map[string]string, error)
 }
 
-// CreateStreamWithHeadersProvider creates a new bidirectional gRPC stream using a custom headers provider.
+// CreateStreamWithHeadersProvider creates a new JSON or Protocol Buffer stream using a custom headers provider.
 // This is useful for testing or when you need custom authentication logic.
 //
 // Parameters:

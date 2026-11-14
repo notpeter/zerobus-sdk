@@ -23,7 +23,7 @@ pub async fn advance_tokio_time_near_instant_limit() {
     let mut low = 0_u64;
     let mut high = u64::MAX;
     while low < high {
-        let mid = ((low as u128 + high as u128 + 1) / 2) as u64;
+        let mid = (low as u128 + high as u128).div_ceil(2) as u64;
         if now
             .checked_add(std::time::Duration::from_secs(mid))
             .is_some()
@@ -71,6 +71,18 @@ impl HeadersProvider for TestHeadersProvider {
         let mut headers = HashMap::new();
         headers.insert("authorization", "Bearer test_token".to_string());
         headers.insert("x-databricks-zerobus-table-name", "test_table".to_string());
+        Ok(headers)
+    }
+}
+
+/// A headers provider that also sends a base64-encoded `-bin` header.
+pub struct BinaryHeadersProvider(pub &'static str);
+
+#[async_trait]
+impl HeadersProvider for BinaryHeadersProvider {
+    async fn get_headers(&self) -> ZerobusResult<HashMap<&'static str, String>> {
+        let mut headers = TestHeadersProvider::default().get_headers().await?;
+        headers.insert("x-test-bin", self.0.to_string());
         Ok(headers)
     }
 }

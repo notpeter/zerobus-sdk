@@ -31,7 +31,7 @@ java/
 │   ├── ZerobusStream.java       # Legacy generic stream (deprecated)
 │   ├── ZerobusProtoStream.java  # Proto ingestion stream
 │   ├── ZerobusJsonStream.java   # JSON ingestion stream
-│   ├── ZerobusArrowStream.java  # Arrow Flight stream (Beta)
+│   ├── ZerobusArrowStream.java  # Arrow Flight stream
 │   ├── NativeLoader.java        # Platform-specific JNI library loading
 │   └── ...                      # Config, exceptions, callbacks
 ├── src/test/                    # JUnit 5 + Mockito tests
@@ -51,6 +51,17 @@ Run from `java/`:
 - `mvn clean package -Dzerobus.skipNativeLibCheck=true` — Build local Java JARs without staged release JNI libraries
 - `mvn spotless:check` — Check formatting (Google Java Format)
 - `mvn spotless:apply` — Auto-format
+
+## Features
+
+- **Avro (Beta)** — `ZerobusAvroStream`, via `streamBuilder().avro(schemaJson)`. The Java side
+  encodes `GenericRecord`s with Apache Avro (`AvroEncoder`); pre-encoded `byte[]` pass through. The
+  record format is fixed at creation (`RecordFormat` → native handle) and reused on ingest.
+  - `org.apache.avro:avro` is a `provided` dependency (caller-supplied, like `arrow-vector`) and
+    needs **Java 11+**; the rest of the SDK stays Java 8. Building therefore needs a **JDK 11+
+    toolchain** (enforced by `maven-enforcer`); the artifact still targets Java 8.
+  - The JNI crate's `avro` cargo feature forwards to the SDK's; `make build-jni` passes it. Never
+    enable it in a plain `--workspace` build, or unification turns Avro on for the FFI crate too.
 
 ## FFI boundary: JNI
 

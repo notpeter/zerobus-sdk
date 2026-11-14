@@ -15,21 +15,25 @@ namespace Databricks.Zerobus;
 /// consumes it. Any further method calls after either will throw
 /// <see cref="ObjectDisposedException"/>.
 /// </para>
+/// <para>
+/// See the <see href="https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id">connection URL table</see>
+/// for cloud-specific endpoint formats.
+/// </para>
 /// </remarks>
 /// <example>
 /// OAuth credentials:
 /// <code>
 /// using var sdk = ZerobusSdk.CreateBuilder()
-///     .Endpoint("https://zerobus.databricks.com")
-///     .UnityCatalogUrl("https://workspace.databricks.com")
+///     .Endpoint(serverEndpoint)
+///     .UnityCatalogUrl(workspaceUrl)
 ///     .ApplicationName("my-service")
 ///     .Build();
 /// </code>
 ///
-/// Custom headers provider (Unity Catalog URL not required):
+/// Custom headers provider (workspace URL not required):
 /// <code>
 /// using var sdk = ZerobusSdk.CreateBuilder()
-///     .Endpoint("https://zerobus.databricks.com")
+///     .Endpoint(serverEndpoint)
 ///     .ApplicationName("my-service")
 ///     .Build();
 /// </code>
@@ -40,6 +44,7 @@ public sealed class ZerobusSdkBuilder : IDisposable
     private string? _unityCatalogUrl;
     private string? _sdkIdentifier;
     private string? _applicationName;
+    private bool? _connectionPerStream;
     private bool _disableTls;
     private int _consumed;  // 0 = live, 1 = consumed/disposed
 
@@ -48,7 +53,7 @@ public sealed class ZerobusSdkBuilder : IDisposable
     /// <summary>
     /// Sets the Zerobus gRPC endpoint URL (required).
     /// </summary>
-    /// <param name="endpoint">The gRPC endpoint (e.g. <c>https://zerobus.databricks.com</c>).</param>
+    /// <param name="endpoint">The Zerobus gRPC endpoint.</param>
     /// <returns>This builder, for chaining.</returns>
     /// <exception cref="ArgumentNullException">Thrown if <paramref name="endpoint"/> is null.</exception>
     /// <exception cref="ObjectDisposedException">Thrown if the builder has been consumed or disposed.</exception>
@@ -61,10 +66,10 @@ public sealed class ZerobusSdkBuilder : IDisposable
     }
 
     /// <summary>
-    /// Sets the Unity Catalog URL used for OAuth token acquisition.
+    /// Sets the Databricks workspace URL, used for Unity Catalog and OAuth token acquisition.
     /// Required when using OAuth credentials; optional with a custom headers provider.
     /// </summary>
-    /// <param name="unityCatalogUrl">The Unity Catalog URL (e.g. <c>https://workspace.databricks.com</c>).</param>
+    /// <param name="unityCatalogUrl">The Databricks workspace URL, used for Unity Catalog and OAuth.</param>
     /// <returns>This builder, for chaining.</returns>
     /// <exception cref="ArgumentNullException">Thrown if <paramref name="unityCatalogUrl"/> is null.</exception>
     /// <exception cref="ObjectDisposedException">Thrown if the builder has been consumed or disposed.</exception>
@@ -110,6 +115,21 @@ public sealed class ZerobusSdkBuilder : IDisposable
     }
 
     /// <summary>
+    /// Controls whether every JSON/protobuf stream receives a dedicated gRPC
+    /// connection. This is enabled by default. Pass <see langword="false"/> to
+    /// share one HTTP/2 connection across streams.
+    /// </summary>
+    /// <param name="enabled">Whether to create a connection per stream.</param>
+    /// <returns>This builder, for chaining.</returns>
+    /// <exception cref="ObjectDisposedException">Thrown if the builder has been consumed or disposed.</exception>
+    public ZerobusSdkBuilder ConnectionPerStream(bool enabled)
+    {
+        ThrowIfConsumed();
+        _connectionPerStream = enabled;
+        return this;
+    }
+
+    /// <summary>
     /// Disables TLS for the gRPC connection. TLS is enabled by default.
     /// Only use this for local development or testing.
     /// </summary>
@@ -148,6 +168,8 @@ public sealed class ZerobusSdkBuilder : IDisposable
                 NativeMethods.SdkBuilderSdkIdentifier(builderPtr, _sdkIdentifier);
             if (_applicationName is not null)
                 NativeMethods.SdkBuilderApplicationName(builderPtr, _applicationName);
+            if (_connectionPerStream.HasValue)
+                NativeMethods.SdkBuilderConnectionPerStream(builderPtr, _connectionPerStream.Value);
             if (_disableTls)
                 NativeMethods.SdkBuilderDisableTls(builderPtr);
         }

@@ -1,6 +1,6 @@
 # NEXT CHANGELOG
 
-## Release v1.7.0
+## Release v1.10.0
 
 ### Major Changes
 
@@ -8,18 +8,33 @@
 
 ### Bug Fixes
 
-### Documentation
+- The library is now built with `rustls-webpki` 0.103.16 and `webpki-roots`
+  1.0.11, which stop trusting the compromised eMudhra (emSign) CAs.
+- The `CRecordArray` returned by `encoded_records_to_c_array` is now allocated at
+  exactly `len` records. It could previously have spare capacity, and
+  `zerobus_free_record_array` then passed the wrong size when freeing it.
+  Released builds were not affected: the library always uses the platform's
+  system allocator, which frees the whole block and ignores the size on every
+  supported platform. The fix makes the code meet Rust's allocation contract,
+  so it stays correct if a size-aware allocator is ever used.
 
-- Clarified that acknowledgment callbacks fire once per logical ingest
-  submission, so one batch ingest call produces one callback.
-- Documented flush, close/free, SDK free, and error-string cleanup in the
-  copyable C lifecycle example.
+### Documentation
 
 ### Internal Changes
 
+- `zerobus_stream_get_unacked_records` and its async variant now report an error
+  through `CResult` for a record type the C API cannot represent, since the Rust
+  SDK's record enums are now `#[non_exhaustive]`
+  ([#909](https://github.com/databricks/zerobus-sdk/issues/909)). No record type
+  reaches this path today. No ABI change; `zerobus.h` is unchanged.
+
 ### Behavior Changes
 
-- `zerobus_arrow_stream_free` now selects destruction behavior based on how the stream was used. IPC-only streams preserve best-effort, nonblocking destruction. Once a stream accepts an Arrow C Data batch, free blocks until Arrow background shutdown completes, every Flight request body reaches EOF or is dropped, and all retained foreign owners are released. Previously, a request body could retain an owner and run its release callback after free returned on an unacknowledged/failure path, risking callback-after-free use of producer state. When the calling restrictions below are respected, no Arrow C Data release callback for that stream can run after free returns. The function logs a warning every 30 seconds while required C Data shutdown remains incomplete; it does not return on a timeout. Callers must not block the only thread, event loop, or runtime lock needed by a release callback: offload free, release required runtime locks, and continue servicing callback dependencies until it completes. Free must not race another operation on the same stream handle. After C Data import, freeing the same stream reentrantly from one of its SDK callbacks is unsupported because complete shutdown would wait for that callback. IPC-only concurrent or reentrant free remains invalid because the opaque handle has single ownership; freeing a different stream from a callback remains supported. During required C Data shutdown, an internal native shutdown panic, a required helper-thread spawn failure, or a helper-thread panic terminates the process rather than returning without the release-callback guarantee.
+- Arrow Flight streams now compress IPC payloads with ZSTD by default.
+  `zerobus_arrow_get_default_config()` returns `ipc_compression = 1` (ZSTD) instead of `-1`
+  (no compression), and passing `options = NULL` to `zerobus_sdk_create_arrow_stream` or
+  `zerobus_sdk_create_arrow_stream_with_headers_provider` also uses ZSTD. Set
+  `ipc_compression = -1` to keep sending uncompressed payloads.
 
 ### Breaking Changes
 

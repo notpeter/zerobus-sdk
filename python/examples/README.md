@@ -1,7 +1,7 @@
 # Zerobus SDK Examples
 
 This directory contains runnable synchronous and asynchronous examples for Protobuf,
-JSON, and Arrow Flight ingestion with the Zerobus Ingest SDK for Python.
+JSON, Avro, and Arrow Flight ingestion with the Zerobus Ingest SDK for Python.
 
 For complete SDK documentation including installation, API reference, and configuration details, see the [main README](../README.md).
 
@@ -17,24 +17,22 @@ cd zerobus-sdk/python
 ### 2. Install Dependencies
 
 ```bash
-pip install -e ".[arrow]"
+pip install -e ".[arrow,avro]"
 ```
 
+The `avro` extra installs `fastavro`, which the Avro examples use to encode dict records.
 The examples use a pre-generated protobuf file (`record_pb2.py`) based on the included `record.proto` schema.
 
 ### 3. Configure Credentials
 
-Set the following environment variables:
+Set the following environment variables. See the [connection URL table](https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id)
+for the endpoint and workspace URL formats on each cloud:
 
 ```bash
 export DATABRICKS_CLIENT_ID="your-service-principal-application-id"
 export DATABRICKS_CLIENT_SECRET="your-service-principal-secret"
-# For AWS:
-export ZEROBUS_SERVER_ENDPOINT="https://workspace-id.zerobus.region.cloud.databricks.com"
-export DATABRICKS_WORKSPACE_URL="https://your-workspace.cloud.databricks.com"
-# For Azure:
-# export ZEROBUS_SERVER_ENDPOINT="https://workspace-id.zerobus.region.azuredatabricks.net"
-# export DATABRICKS_WORKSPACE_URL="https://your-workspace.azuredatabricks.net"
+export ZEROBUS_SERVER_ENDPOINT="<your-zerobus-server-endpoint>"
+export DATABRICKS_WORKSPACE_URL="<your-databricks-workspace-url>"
 export ZEROBUS_TABLE_NAME="catalog.schema.table"
 ```
 
@@ -44,12 +42,16 @@ export ZEROBUS_TABLE_NAME="catalog.schema.table"
 # Synchronous examples (blocking I/O)
 python examples/sync_example_proto.py     # Protobuf
 python examples/sync_example_json.py      # JSON
+python examples/sync_example_avro.py      # Avro
 python examples/sync_example_arrow.py     # Arrow Flight
+python examples/sync_example_persistent.py # Persistent stream (set ZEROBUS_PERSISTENT_STREAM_ID to resume)
 
 # Asynchronous examples (non-blocking I/O)
 python examples/async_example_proto.py    # Protobuf
 python examples/async_example_json.py     # JSON
+python examples/async_example_avro.py     # Avro
 python examples/async_example_arrow.py    # Arrow Flight
+python examples/async_example_persistent.py # Persistent stream (set ZEROBUS_PERSISTENT_STREAM_ID to resume)
 ```
 
 ## Examples Overview
@@ -65,8 +67,8 @@ are not shown because they spawn detached tasks and are not safely synchronized 
 
 ### Serialization Formats
 
-The row-oriented examples cover two serialization formats. The Arrow Flight
-examples use `pyarrow.RecordBatch` data instead.
+The row-oriented examples cover three serialization formats (Protobuf, JSON, Avro). The
+Arrow Flight examples use `pyarrow.RecordBatch` data instead.
 
 #### Protocol Buffers
 **Files:** `sync_example_proto.py`, `async_example_proto.py`
@@ -92,6 +94,14 @@ stream.flush()
 # offset = stream.ingest_record_offset(record.SerializeToString())
 ```
 
+#### Persistent stream
+**Files:** `sync_example_persistent.py`, `async_example_persistent.py`
+
+Creates a persistent (Eos) stream, or resumes one, and ingests JSON records. On the first
+run, leave `ZEROBUS_PERSISTENT_STREAM_ID` unset. The example prints the new `stream_id`. Save
+it, then set `ZEROBUS_PERSISTENT_STREAM_ID` to that value on a later run to resume the same
+stream. Delivery into Delta stays exactly-once.
+
 #### JSON
 **Files:** `sync_example_json.py`, `async_example_json.py`
 
@@ -114,6 +124,23 @@ stream.flush()
 
 # Option 2: Pass pre-serialized JSON string (client controls serialization)
 # offset = stream.ingest_record_offset(json.dumps(record_dict))
+```
+
+#### Avro (beta)
+**Files:** `sync_example_avro.py`, `async_example_avro.py`
+
+Row-oriented binary encoding against a declared writer schema. You can pass either:
+- **dict** (encoded with `fastavro`; install the `avro` extra)
+- **Pre-encoded Avro bytes** (client controls encoding; no extra needed)
+
+```python
+import json
+
+table_properties = TableProperties(TABLE_NAME, avro_schema=json.dumps(schema))
+
+# Recommended: ingest_record_offset() then flush() once
+offset = stream.ingest_record_offset({"device_name": "sensor-1", "temp": 25})
+stream.flush()
 ```
 
 ### Synchronous vs Asynchronous APIs
@@ -179,6 +206,7 @@ The nowait APIs spawn detached tasks and are not safely synchronized with `flush
 |--------|-------------|---------------|
 | **Protobuf** | `Message` object or `bytes` | `TableProperties(table_name, descriptor_proto=descriptor)` |
 | **JSON** | `dict` or `str` (JSON string) | `TableProperties(table_name)` |
+| **Avro** (beta) | `dict` or pre-encoded `bytes` | `TableProperties(table_name, avro_schema=json_schema)` |
 
 ## Authentication
 

@@ -38,12 +38,14 @@ import org.slf4j.LoggerFactory;
  *
  * <h3>Example Usage</h3>
  *
- * <p>Use {@link #streamBuilder()} to create streams:
+ * <p>Use {@link #streamBuilder()} to create streams. Find cloud-specific endpoint formats in the <a
+ * href="https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id">connection
+ * URL table</a>:
  *
  * <pre>{@code
  * try (ZerobusSdk sdk = new ZerobusSdk(
- *         "https://server-endpoint.databricks.com",
- *         "https://workspace.databricks.com")) {
+ *         serverEndpoint,
+ *         workspaceUrl)) {
  *
  *     // For Protocol Buffer ingestion:
  *     try (ZerobusProtoStream protoStream = sdk.streamBuilder()
@@ -96,7 +98,7 @@ public class ZerobusSdk implements AutoCloseable {
    * Creates a new ZerobusSdk instance.
    *
    * @param serverEndpoint The gRPC endpoint URL for the Zerobus service.
-   * @param unityCatalogEndpoint The Unity Catalog endpoint URL.
+   * @param unityCatalogEndpoint The Databricks workspace URL, used for Unity Catalog and OAuth.
    * @throws ZerobusException if the SDK cannot be initialized
    */
   public ZerobusSdk(String serverEndpoint, String unityCatalogEndpoint) {
@@ -104,10 +106,24 @@ public class ZerobusSdk implements AutoCloseable {
   }
 
   /**
+   * Creates a new ZerobusSdk instance with configurable connection ownership.
+   *
+   * @param serverEndpoint The gRPC endpoint URL for the Zerobus service.
+   * @param unityCatalogEndpoint The Databricks workspace URL, used for Unity Catalog and OAuth.
+   * @param connectionPerStream Whether every JSON/protobuf stream receives a dedicated gRPC
+   *     connection. Pass {@code false} to share one connection across streams.
+   * @throws ZerobusException if the SDK cannot be initialized
+   */
+  public ZerobusSdk(
+      String serverEndpoint, String unityCatalogEndpoint, boolean connectionPerStream) {
+    this(serverEndpoint, unityCatalogEndpoint, null, connectionPerStream);
+  }
+
+  /**
    * Creates a new ZerobusSdk instance with an optional application identifier.
    *
    * @param serverEndpoint The gRPC endpoint URL for the Zerobus service.
-   * @param unityCatalogEndpoint The Unity Catalog endpoint URL.
+   * @param unityCatalogEndpoint The Databricks workspace URL, used for Unity Catalog and OAuth.
    * @param applicationName Optional application identifier appended to the HTTP {@code user-agent}
    *     header, conventionally {@code "<product>/<version>"} (e.g. {@code "my-app/1.0"}). When set,
    *     the header becomes {@code "zerobus-sdk-java/<version> <applicationName>"}. Pass {@code
@@ -118,6 +134,35 @@ public class ZerobusSdk implements AutoCloseable {
     this.serverEndpoint = serverEndpoint;
     this.unityCatalogEndpoint = unityCatalogEndpoint;
     this.nativeHandle = nativeCreate(serverEndpoint, unityCatalogEndpoint, applicationName);
+    if (this.nativeHandle == 0) {
+      throw new RuntimeException("Failed to create native SDK instance");
+    }
+    logger.debug("ZerobusSdk created for endpoint: {}", serverEndpoint);
+  }
+
+  /**
+   * Creates a new ZerobusSdk instance with an optional application identifier and configurable
+   * connection ownership.
+   *
+   * @param serverEndpoint The gRPC endpoint URL for the Zerobus service.
+   * @param unityCatalogEndpoint The Databricks workspace URL, used for Unity Catalog and OAuth.
+   * @param applicationName Optional application identifier appended to the HTTP {@code user-agent}
+   *     header, or {@code null} to omit.
+   * @param connectionPerStream Whether every JSON/protobuf stream receives a dedicated gRPC
+   *     connection. This is {@code true} in the other constructors; pass {@code false} to share one
+   *     connection across streams.
+   * @throws ZerobusException if the SDK cannot be initialized
+   */
+  public ZerobusSdk(
+      String serverEndpoint,
+      String unityCatalogEndpoint,
+      String applicationName,
+      boolean connectionPerStream) {
+    this.serverEndpoint = serverEndpoint;
+    this.unityCatalogEndpoint = unityCatalogEndpoint;
+    this.nativeHandle =
+        nativeCreateWithConnectionPerStream(
+            serverEndpoint, unityCatalogEndpoint, applicationName, connectionPerStream);
     if (this.nativeHandle == 0) {
       throw new RuntimeException("Failed to create native SDK instance");
     }
@@ -235,11 +280,12 @@ public class ZerobusSdk implements AutoCloseable {
             nativeHandle,
             tableName,
             descriptorProtoBytes,
+            null,
             effectiveClientId,
             effectiveClientSecret,
             headersProvider,
             effectiveOptions,
-            false);
+            RecordFormat.PROTO.code());
 
     return handleFuture.thenApply(
         handle -> {
@@ -340,11 +386,12 @@ public class ZerobusSdk implements AutoCloseable {
             nativeHandle,
             tableName,
             null,
+            null,
             effectiveClientId,
             effectiveClientSecret,
             headersProvider,
             effectiveOptions,
-            true);
+            RecordFormat.JSON.code());
 
     return handleFuture.thenApply(
         handle -> {
@@ -358,6 +405,130 @@ public class ZerobusSdk implements AutoCloseable {
               effectiveClientId,
               effectiveClientSecret,
               headersProvider);
+        });
+  }
+
+  // ==================== Avro Stream Creation ====================
+
+  /**
+   * Shared implementation for creating an Avro stream. Used by {@link #streamBuilder()}.
+   *
+   * <p>Ingesting record objects requires Java 11+ and the {@code org.apache.avro:avro} dependency
+   * on the classpath; the pre-encoded {@code byte[]} path needs neither.
+   */
+  CompletableFuture<ZerobusAvroStream> createAvroStreamInternal(
+      String tableName,
+      String avroSchemaJson,
+      String clientId,
+      String clientSecret,
+      HeadersProvider headersProvider,
+      StreamConfigurationOptions options) {
+
+    ensureOpen();
+
+    StreamConfigurationOptions effectiveOptions = options != null ? options : DEFAULT_OPTIONS;
+    String effectiveClientId = headersProvider == null ? clientId : "";
+    String effectiveClientSecret = headersProvider == null ? clientSecret : "";
+
+    logger.debug("Creating Avro stream for table: {}", tableName);
+
+    // The native layer validates the writer schema; a bad one fails the future below.
+    CompletableFuture<Long> handleFuture =
+        createNativeStream(
+            nativeHandle,
+            tableName,
+            null,
+            avroSchemaJson,
+            effectiveClientId,
+            effectiveClientSecret,
+            headersProvider,
+            effectiveOptions,
+            RecordFormat.AVRO.code());
+
+    return handleFuture.thenApply(
+        handle -> {
+          if (handle == null || handle == 0) {
+            throw new RuntimeException("Failed to create Avro stream: null handle returned");
+          }
+          return new ZerobusAvroStream(
+              handle,
+              tableName,
+              effectiveOptions,
+              avroSchemaJson,
+              effectiveClientId,
+              effectiveClientSecret,
+              headersProvider);
+        });
+  }
+
+  /**
+   * Recreates an Avro stream from a closed stream, re-ingesting unacknowledged records.
+   *
+   * <p>The original stream must be closed before calling this method.
+   *
+   * @param closedStream the closed stream to recreate
+   * @return a future that completes with the new stream after unacked records are re-ingested
+   * @throws IllegalStateException if the original stream is not closed
+   */
+  public CompletableFuture<ZerobusAvroStream> recreateStream(ZerobusAvroStream closedStream) {
+    if (!closedStream.isClosed()) {
+      throw new IllegalStateException("Stream must be closed before recreation");
+    }
+
+    ensureOpen();
+
+    List<EncodedBatch> unackedBatches;
+    try {
+      unackedBatches = closedStream.cacheAndReleaseUnackedBatches();
+    } catch (ZerobusException e) {
+      CompletableFuture<ZerobusAvroStream> failed = new CompletableFuture<>();
+      failed.completeExceptionally(e);
+      return failed;
+    }
+
+    CompletableFuture<Long> handleFuture =
+        createNativeStream(
+            nativeHandle,
+            closedStream.getTableName(),
+            null,
+            closedStream.getAvroSchemaJson(),
+            closedStream.getClientId(),
+            closedStream.getClientSecret(),
+            closedStream.getHeadersProvider(),
+            closedStream.getOptions(),
+            RecordFormat.AVRO.code());
+
+    return handleFuture.thenApply(
+        handle -> {
+          if (handle == null || handle == 0) {
+            throw new RuntimeException("Failed to recreate Avro stream: null handle returned");
+          }
+          ZerobusAvroStream newStream =
+              new ZerobusAvroStream(
+                  handle,
+                  closedStream.getTableName(),
+                  closedStream.getOptions(),
+                  closedStream.getAvroSchemaJson(),
+                  closedStream.getClientId(),
+                  closedStream.getClientSecret(),
+                  closedStream.getHeadersProvider());
+
+          boolean replaySucceeded = false;
+          try {
+            for (EncodedBatch batch : unackedBatches) {
+              newStream.ingestRecordsOffset(batch.getRecords());
+            }
+            newStream.flush();
+            replaySucceeded = true;
+          } catch (ZerobusException e) {
+            throw new RuntimeException("Failed to re-ingest unacked records", e);
+          } finally {
+            if (!replaySucceeded) {
+              newStream.discardFailedRecreation();
+            }
+          }
+
+          return newStream;
         });
   }
 
@@ -395,11 +566,12 @@ public class ZerobusSdk implements AutoCloseable {
             nativeHandle,
             tableProperties.getTableName(),
             descriptorProtoBytes,
+            null,
             clientId,
             clientSecret,
             null,
             effectiveOptions,
-            false);
+            RecordFormat.PROTO.code());
 
     return handleFuture.thenApply(
         handle -> {
@@ -431,9 +603,6 @@ public class ZerobusSdk implements AutoCloseable {
 
   /**
    * Creates a new Arrow Flight stream for ingesting Arrow record batches into a table.
-   *
-   * <p><b>Beta:</b> Arrow Flight ingestion is in Beta. The API is stabilising but may still change
-   * before reaching GA.
    *
    * @param tableName The fully qualified table name (catalog.schema.table).
    * @param schema The Arrow schema describing the columns of the target table.
@@ -571,11 +740,12 @@ public class ZerobusSdk implements AutoCloseable {
             nativeHandle,
             closedStream.getTableName(),
             closedStream.getDescriptorProtoBytes(),
+            null,
             closedStream.getClientId(),
             closedStream.getClientSecret(),
             closedStream.getHeadersProvider(),
             closedStream.getOptions(),
-            false);
+            RecordFormat.PROTO.code());
 
     return handleFuture.thenApply(
         handle -> {
@@ -652,11 +822,12 @@ public class ZerobusSdk implements AutoCloseable {
             nativeHandle,
             closedStream.getTableName(),
             null,
+            null,
             closedStream.getClientId(),
             closedStream.getClientSecret(),
             closedStream.getHeadersProvider(),
             closedStream.getOptions(),
-            true);
+            RecordFormat.JSON.code());
 
     return handleFuture.thenApply(
         handle -> {
@@ -798,11 +969,12 @@ public class ZerobusSdk implements AutoCloseable {
             nativeHandle,
             tableProperties.getTableName(),
             descriptorProtoBytes,
+            null,
             closedStream.getClientId(),
             closedStream.getClientSecret(),
             null,
             closedStream.getOptions(),
-            false);
+            RecordFormat.PROTO.code());
 
     return handleFuture.thenApply(
         handle -> {
@@ -821,7 +993,7 @@ public class ZerobusSdk implements AutoCloseable {
           boolean replaySucceeded = false;
           try {
             for (byte[] record : unackedRecords) {
-              newStream.nativeIngestRecordOffset(newStream.nativeHandle, record, false);
+              newStream.ingestEncoded(record);
             }
             newStream.flush();
             replaySucceeded = true;
@@ -861,24 +1033,33 @@ public class ZerobusSdk implements AutoCloseable {
       long sdkHandle,
       String tableName,
       byte[] descriptorProto,
+      String avroSchemaJson,
       String clientId,
       String clientSecret,
       HeadersProvider headersProvider,
       Object options,
-      boolean isJson) {
+      int formatCode) {
     if (headersProvider == null) {
       return nativeCreateStream(
-          sdkHandle, tableName, descriptorProto, clientId, clientSecret, options, isJson);
+          sdkHandle,
+          tableName,
+          descriptorProto,
+          avroSchemaJson,
+          clientId,
+          clientSecret,
+          options,
+          formatCode);
     }
     return nativeCreateStreamWithHeadersProvider(
         sdkHandle,
         tableName,
         descriptorProto,
+        avroSchemaJson,
         clientId,
         clientSecret,
         headersProvider,
         options,
-        isJson);
+        formatCode);
   }
 
   private CompletableFuture<Long> createNativeArrowStream(
@@ -902,26 +1083,34 @@ public class ZerobusSdk implements AutoCloseable {
   private static native long nativeCreate(
       String serverEndpoint, String unityCatalogEndpoint, String applicationName);
 
+  private static native long nativeCreateWithConnectionPerStream(
+      String serverEndpoint,
+      String unityCatalogEndpoint,
+      String applicationName,
+      boolean connectionPerStream);
+
   private static native void nativeDestroy(long handle);
 
   private native CompletableFuture<Long> nativeCreateStream(
       long sdkHandle,
       String tableName,
       byte[] descriptorProto,
+      String avroSchemaJson,
       String clientId,
       String clientSecret,
       Object options,
-      boolean isJson);
+      int formatCode);
 
   private native CompletableFuture<Long> nativeCreateStreamWithHeadersProvider(
       long sdkHandle,
       String tableName,
       byte[] descriptorProto,
+      String avroSchemaJson,
       String clientId,
       String clientSecret,
       HeadersProvider headersProvider,
       Object options,
-      boolean isJson);
+      int formatCode);
 
   private native CompletableFuture<Long> nativeCreateArrowStream(
       long sdkHandle,

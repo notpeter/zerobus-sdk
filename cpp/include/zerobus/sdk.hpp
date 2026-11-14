@@ -28,9 +28,11 @@ class Sdk;
 
 /// Fluent builder for `Sdk`. Obtain one from `Sdk::builder()`.
 ///
-/// At minimum, set `endpoint()`. The Unity Catalog URL is required for the
+/// At minimum, set `endpoint()`. The workspace URL is required for the
 /// OAuth client-credentials path but optional when a custom `HeadersProvider`
-/// supplies authentication.
+/// supplies authentication. For the endpoint and workspace URL formats on each
+/// cloud, see
+/// https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id
 class SdkBuilder {
  public:
   SdkBuilder();
@@ -43,13 +45,17 @@ class SdkBuilder {
 
   /// Zerobus gRPC endpoint URL (required).
   SdkBuilder& endpoint(const std::string& value);
-  /// Unity Catalog URL. Optional when using a custom headers provider.
+  /// Databricks workspace URL, used for Unity Catalog and OAuth. Optional
+  /// when using a custom headers provider.
   SdkBuilder& unity_catalog_url(const std::string& value);
   /// Override the SDK prefix of the `user-agent` header. Defaults to
   /// `zerobus-sdk-cpp/<version>`.
   SdkBuilder& sdk_identifier(const std::string& value);
   /// Append an application identifier to the `user-agent` header.
   SdkBuilder& application_name(const std::string& value);
+  /// Give each JSON/protobuf stream a dedicated gRPC connection (default:
+  /// true). Pass false to share one connection across streams.
+  SdkBuilder& connection_per_stream(bool enabled);
   /// Select a plaintext (non-TLS) gRPC channel. TLS is on by default.
   SdkBuilder& disable_tls();
 
@@ -94,7 +100,7 @@ class Sdk {
                        std::shared_ptr<HeadersProvider> headers_provider,
                        const StreamOptions& options = {});
 
-  /// Create an Arrow Flight stream (Beta) authenticated with OAuth client
+  /// Create an Arrow Flight stream authenticated with OAuth client
   /// credentials. `schema_ipc_bytes` is an Arrow IPC stream encoding only the
   /// schema (an empty IPC stream with just the schema message).
   ArrowStream create_arrow_stream(
@@ -103,7 +109,7 @@ class Sdk {
       const std::string& client_id, const std::string& client_secret,
       const ArrowStreamOptions& options = {});
 
-  /// Create an Arrow Flight stream (Beta) authenticated with a custom headers
+  /// Create an Arrow Flight stream authenticated with a custom headers
   /// provider.
   ArrowStream create_arrow_stream(
       const std::string& table_name,

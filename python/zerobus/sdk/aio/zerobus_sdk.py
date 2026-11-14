@@ -7,12 +7,15 @@ Rust core with native async/await support for optimal performance in async appli
 
 Example:
     >>> import asyncio
+    >>> import os
     >>> from zerobus.sdk.aio import ZerobusSdk, TableProperties
+    >>> server_endpoint = os.environ["ZEROBUS_SERVER_ENDPOINT"]
+    >>> workspace_url = os.environ["DATABRICKS_WORKSPACE_URL"]
     >>>
     >>> async def main():
     ...     sdk = ZerobusSdk(
-    ...         host="https://your-shard-id.zerobus.region.cloud.databricks.com",
-    ...         unity_catalog_url="https://your-workspace.cloud.databricks.com",
+    ...         host=server_endpoint,
+    ...         unity_catalog_url=workspace_url,
     ...         application_name="my-app/1.0",  # optional
     ...     )
     ...
@@ -43,10 +46,12 @@ from typing import Any, Optional
 
 # Import Rust-backed implementations
 import zerobus._zerobus_core as _core
+from zerobus.sdk.shared.persistent import _PersistentStreamBuilderBase
 
 # Import base Rust stream class
 _RustZerobusStream = _core.aio.ZerobusStream
 _RustAsyncZerobusArrowStream = _core.arrow.AsyncZerobusArrowStream
+_RustPersistentStream = _core.aio.PersistentStream
 
 
 class ZerobusStream:
@@ -58,10 +63,20 @@ class ZerobusStream:
     2. Second await: Waits for acknowledgment
 
     This allows batching submissions without blocking on acknowledgments.
+    Handles Avro encoding transparently when avro_schema is set.
     """
 
-    def __init__(self, rust_stream: _RustZerobusStream):
+    def __init__(self, rust_stream: _RustZerobusStream, avro_encoder=None):
         self._inner = rust_stream
+        self._avro = avro_encoder  # AvroEncoder for an Avro stream, else None
+
+    def _encode_payload(self, payload):
+        """Encode payload to Avro bytes on an Avro stream; else pass through."""
+        return payload if self._avro is None else self._avro.encode(payload)
+
+    def _encode_payloads(self, payloads):
+        """Encode a batch on an Avro stream; else pass through."""
+        return payloads if self._avro is None else self._avro.encode_batch(payloads)
 
     async def ingest_record(self, payload: Any):
         """Ingest a single record (deprecated - use ingest_record_offset).
@@ -86,6 +101,8 @@ class ZerobusStream:
         Returns:
             An awaitable future that, when awaited, waits for acknowledgment and returns the offset
         """
+        # Encode if avro
+        payload = self._encode_payload(payload)
         # Stage 1: Submit record and get offset (fast!)
         offset = await self._inner.ingest_record_offset(payload)
 
@@ -104,6 +121,7 @@ class ZerobusStream:
         acknowledgment in the background. The idiomatic flow is to ingest in a loop and
         ``await flush()`` once to confirm durability (or use an ``AckCallback``).
         """
+        payload = self._encode_payload(payload)
         return await self._inner.ingest_record_offset(payload)
 
     def ingest_record_nowait(self, payload: Any):
@@ -113,10 +131,12 @@ class ZerobusStream:
         before the task allocates an offset, so this is not a safe durability path.
         Prefer ``ingest_record_offset()`` or ``ingest_records_offset()``.
         """
+        payload = self._encode_payload(payload)
         return self._inner.ingest_record_nowait(payload)
 
     async def ingest_records_offset(self, payloads):
         """Submit batch of records and return final offset."""
+        payloads = self._encode_payloads(payloads)
         return await self._inner.ingest_records_offset(payloads)
 
     def ingest_records_nowait(self, payloads):
@@ -125,6 +145,7 @@ class ZerobusStream:
         Same detached-task caveats as ``ingest_record_nowait()``. Prefer
         ``ingest_records_offset()``.
         """
+        payloads = self._encode_payloads(payloads)
         return self._inner.ingest_records_nowait(payloads)
 
     async def wait_for_offset(self, offset: int):
@@ -183,8 +204,6 @@ class ZerobusArrowStream:
     """
     Asynchronous Arrow Flight stream for ingesting pyarrow RecordBatches.
 
-    **Beta**: Arrow Flight support is in Beta. The API is stabilising but may
-    still change before reaching GA.
     """
 
     def __init__(self, rust_stream: _RustAsyncZerobusArrowStream):
@@ -249,30 +268,129 @@ class ZerobusArrowStream:
         return [_deserialize_batch(ipc_bytes) for ipc_bytes in ipc_list]
 
 
+class PersistentStream:
+    """
+    A durable, recoverable ingestion stream (Eos).
+
+    Create or resume one with ``ZerobusSdk.persistent_stream_builder()``. Ingest in a loop,
+    then ``await flush()`` once to confirm the batch.
+
+    This wrapper makes every method a coroutine function, so ``asyncio.create_task(stream.flush())``
+    works. The native methods return futures, which ``create_task`` rejects.
+    """
+
+    def __init__(self, rust_stream: _RustPersistentStream):
+        self._inner = rust_stream
+
+    @property
+    def stream_id(self) -> Optional[str]:
+        """The durable stream identity. Persist it to resume the stream later."""
+        return self._inner.stream_id
+
+    @property
+    def resume_watermark(self) -> Optional[int]:
+        """The offset the server had committed when the stream opened, or ``None`` if nothing
+        was committed yet (always ``None`` for a new stream)."""
+        return self._inner.resume_watermark
+
+    @property
+    def is_closed(self) -> bool:
+        """Whether the stream is closed. A close that is in progress counts as closed."""
+        return self._inner.is_closed
+
+    async def ingest_record_offset(self, payload: Any) -> int:
+        """Queue a record and return its offset. Does not wait for the acknowledgment."""
+        return await self._inner.ingest_record_offset(payload)
+
+    async def ingest_records_offset(self, payloads) -> Optional[int]:
+        """Queue a batch and return one offset for it, or ``None`` for an empty batch."""
+        return await self._inner.ingest_records_offset(payloads)
+
+    async def wait_for_offset(self, offset: int) -> None:
+        """Wait until the server acknowledges ``offset``."""
+        await self._inner.wait_for_offset(offset)
+
+    async def flush(self) -> None:
+        """Wait until the server acknowledges all pending records."""
+        await self._inner.flush()
+
+    async def close(self) -> None:
+        """Flush pending records and close the stream."""
+        await self._inner.close()
+
+
+class PersistentStreamBuilder(_PersistentStreamBuilderBase):
+    """Fluent builder that creates or resumes a persistent (Eos) stream.
+
+    Obtain one from ``ZerobusSdk.persistent_stream_builder()``, set the table, authentication
+    and record format, then call ``build()`` or ``resume()``.
+
+    Example:
+        >>> stream = await (
+        ...     sdk.persistent_stream_builder()
+        ...     .table("catalog.schema.events")
+        ...     .oauth("client-id", "client-secret")
+        ...     .json()
+        ...     .build()
+        ... )
+        >>> stream_id = stream.stream_id  # persist this to resume after a restart
+    """
+
+    async def build(self) -> PersistentStream:
+        """Open a new persistent stream. The server assigns its ``stream_id``.
+
+        Raises:
+            ValueError: If the table, authentication, or record format is not set.
+        """
+        table_properties, settings = self._native_args()
+        return PersistentStream(await self._sdk.open_persistent_stream(table_properties, settings))
+
+    async def resume(self, stream_id: str) -> PersistentStream:
+        """Reconnect to an existing persistent stream by its ``stream_id``.
+
+        The table and record format must match those the stream was created with. New
+        records get offsets that start after ``resume_watermark``.
+
+        Raises:
+            ValueError: If the table, authentication, or record format is not set.
+        """
+        table_properties, settings = self._native_args()
+        return PersistentStream(
+            await self._sdk.open_persistent_stream(table_properties, settings, self._check_stream_id(stream_id))
+        )
+
+
 class ZerobusSdk:
     """Python wrapper around Rust ZerobusSdk that returns wrapped streams."""
 
-    def __init__(self, host: str, unity_catalog_url: str, application_name: Optional[str] = None):
+    def __init__(
+        self,
+        host: str,
+        unity_catalog_url: str,
+        application_name: Optional[str] = None,
+        connection_per_stream: bool = True,
+    ):
         """
         Create a Zerobus SDK instance.
 
         Args:
-            host: Zerobus endpoint URL
-                (e.g. "https://<workspace>.zerobus.<region>.cloud.databricks.com").
-            unity_catalog_url: Unity Catalog URL used for OAuth.
+            host: Zerobus server endpoint URL. For the format on each cloud, see
+                https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id.
+            unity_catalog_url: Databricks workspace URL used for Unity Catalog and OAuth.
             application_name: Optional caller identifier (conventionally
                 "<product>/<version>") appended to the HTTP user-agent header on
                 gRPC requests toward the Zerobus server.
+            connection_per_stream: Whether each JSON/protobuf stream gets a
+                dedicated gRPC connection. Defaults to True. Set to False to
+                share one connection across streams.
         """
-        self._inner = _core.aio.ZerobusSdk(host, unity_catalog_url, application_name)
+        self._inner = _core.aio.ZerobusSdk(host, unity_catalog_url, application_name, connection_per_stream)
 
     async def create_arrow_stream(
         self, table_name: str, schema, client_id: str, client_secret: str, options=None
     ) -> ZerobusArrowStream:
         """
         Create an Arrow Flight stream with OAuth client credentials (async).
-
-        **Beta**: Arrow Flight support is in Beta.
 
         Args:
             table_name: Fully qualified table name (catalog.schema.table).
@@ -295,8 +413,6 @@ class ZerobusSdk:
     ) -> ZerobusArrowStream:
         """
         Create an Arrow Flight stream with a custom headers provider (async).
-
-        **Beta**: Arrow Flight support is in Beta.
 
         Args:
             table_name: Fully qualified table name (catalog.schema.table).
@@ -322,14 +438,16 @@ class ZerobusSdk:
 
     async def create_stream(
         self,
-        client_id: str,
-        client_secret: str,
-        table_properties,
+        client_id: str = None,
+        client_secret: str = None,
+        table_properties=None,
         options=None,
         headers_provider=None,
+        *,
+        auth=None,
     ):
         """
-        Create a stream with OAuth authentication or custom headers provider.
+        Create a stream with OAuth, external-IdP federation, or a custom headers provider.
 
         Args:
             client_id: OAuth client ID
@@ -337,21 +455,69 @@ class ZerobusSdk:
             table_properties: Table configuration
             options: Optional stream configuration
             headers_provider: Optional custom headers provider (if set, overrides OAuth)
+            auth: Optional FederatedToken for external-IdP (e.g. Entra ID) federation;
+                when set, client_id/client_secret are not required. Its
+                idp_token_supplier may be a sync or async callable.
         """
-        if headers_provider is not None:
+        if auth is not None and (client_id is not None or client_secret is not None):
+            raise ValueError(
+                "client_id/client_secret cannot be combined with auth=; "
+                "pass table_properties as a keyword when using auth=, "
+                "e.g. create_stream(table_properties=..., auth=...)"
+            )
+        if table_properties is None:
+            raise ValueError("table_properties is required")
+
+        from zerobus.sdk.shared.avro import make_encoder
+
+        avro_encoder = make_encoder(table_properties.avro_schema)
+
+        if auth is not None:
+            from zerobus.sdk.shared.auth import FederatedToken
+
+            if not isinstance(auth, FederatedToken):
+                raise ValueError("auth= must be a FederatedToken instance")
+            # External-IdP federation (RFC 8693). Build a FRESH native supplier per
+            # stream, here inside the running loop so allow_async=True can capture
+            # the current loop's task-locals to drive an async callback. Not
+            # memoized on the FederatedToken (a cached handle would freeze the first
+            # loop, breaking a later asyncio.run()). Reuse shares via _cache_identity.
+            native_supplier = _core.IdpSupplier(auth.idp_token_supplier, True, auth._cache_identity)
+            # The native supplier holds the callback (and the captured loop/context)
+            # on a GC-visible holder that it references only weakly;
+            # create_stream_federated moves the sole retained strong reference onto
+            # the stream, keeping a self-referential owner/stream/callback cycle
+            # collectable.
+            rust_stream = await self._inner.create_stream_federated(
+                table_properties, native_supplier, auth.databricks_client_id, options
+            )
+        elif headers_provider is not None:
             # Use custom headers provider (ignores client_id/client_secret)
             rust_stream = await self._inner.create_stream_with_headers_provider(
                 table_properties, headers_provider, options
             )
         else:
             # Use OAuth authentication
+            if client_id is None or client_secret is None:
+                raise ValueError("client_id and client_secret are required unless auth= or headers_provider= is given")
             rust_stream = await self._inner.create_stream(client_id, client_secret, table_properties, options)
-        return ZerobusStream(rust_stream)
+        return ZerobusStream(rust_stream, avro_encoder=avro_encoder)
+
+    def persistent_stream_builder(self) -> PersistentStreamBuilder:
+        """
+        Start building a persistent (Eos) stream.
+
+        A persistent stream records its identity and committed offset on the server, so
+        ``PersistentStreamBuilder.resume()`` can reconnect to it after a restart with
+        exactly-once delivery. It supports JSON and protobuf records, with OAuth or a custom
+        headers provider.
+        """
+        return PersistentStreamBuilder(self._inner)
 
     async def recreate_stream(self, old_stream: ZerobusStream):
-        """Recreate a stream from an old stream."""
+        """Recreate a stream from an old stream, preserving the Avro encoder if set."""
         rust_stream = await self._inner.recreate_stream(old_stream._inner)
-        return ZerobusStream(rust_stream)
+        return ZerobusStream(rust_stream, avro_encoder=old_stream._avro)
 
 
 # Re-export common types for convenience
@@ -366,6 +532,8 @@ NonRetriableException = _core.NonRetriableException
 __all__ = [
     "ZerobusSdk",
     "ZerobusStream",
+    "PersistentStream",
+    "PersistentStreamBuilder",
     "ZerobusArrowStream",
     "TableProperties",
     "StreamConfigurationOptions",

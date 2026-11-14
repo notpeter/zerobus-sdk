@@ -42,18 +42,33 @@ We try to provide prebuilt native binaries for the following platforms:
 
 Before using any SDK, you need the following:
 
-### 1. Workspace URL and Workspace ID
+### 1. Connection URLs and Workspace ID
 
-After logging into your Databricks workspace, look at the browser URL:
+Every SDK takes two URLs: the Databricks workspace URL, used for Unity Catalog and OAuth,
+and the Zerobus server endpoint, used for ingestion. Their format depends on the cloud
+that hosts your workspace:
 
-```
-https://<databricks-instance>.cloud.databricks.com/o=<workspace-id>
-```
+| Cloud | Databricks workspace URL | Zerobus server endpoint |
+| ----- | ------------------------ | ----------------------- |
+| AWS | `https://<databricks-instance>.cloud.databricks.com` | `https://<workspace-id>.zerobus.<region>.cloud.databricks.com` |
+| Azure | `https://<databricks-instance>.azuredatabricks.net` | `https://<workspace-id>.zerobus.<region>.azuredatabricks.net` |
+| GCP | `https://<databricks-instance>.gcp.databricks.com` | `https://<workspace-id>.zerobus.<region>.gcp.databricks.com` |
 
-- **Workspace URL**: The part before `/o=` (e.g., `https://dbc-a1b2c3d4-e5f6.cloud.databricks.com`)
-- **Workspace ID**: The part after `/o=` (e.g., `1234567890123456`)
+After logging into your workspace, look at the browser URL, for example
+`https://<databricks-instance>.cloud.databricks.com/?o=<workspace-id>`:
 
-> **Note:** The examples above show AWS endpoints (`.cloud.databricks.com`). For Azure deployments, the workspace URL will be `https://<databricks-instance>.azuredatabricks.net`.
+- Workspace URL: everything before `/?o=`. Use it exactly as shown.
+- Workspace ID: the number after `o=`. If the browser URL has no `o=` parameter, copy
+  the ID from the account console or the workspace details page.
+- Region: the cloud region the workspace is deployed in, such as `us-west-2` on AWS,
+  `eastus2` on Azure, or `us-east1` on GCP.
+
+The Zerobus endpoint is built from the workspace ID and region, not from the workspace
+host. On GCP, for example, the workspace URL `https://1234567890123456.0.gcp.databricks.com`
+pairs with the endpoint `https://1234567890123456.zerobus.us-east1.gcp.databricks.com`.
+
+Pass both values as complete URLs, including `https://`, for consistent behavior across
+SDKs.
 
 ### 2. Create a Delta Table
 
@@ -97,49 +112,72 @@ The service principal's **Application ID** is your OAuth **Client ID**, and the 
 
 ## Ingestion APIs
 
-Pick the API that matches your data.
+Pick the record format that matches your data.
 
-### Standard gRPC ingestion
+- JSON: schema-free ingestion. Pass a JSON string or a native object (dict, map, and so on) and the SDK serializes it. No compilation step. Good for getting started or dynamic schemas.
+- Protocol Buffers: strongly-typed, schema-validated ingestion. More compact on the wire than JSON. A typical choice for production workloads that are not already producing Arrow.
+- Avro (beta): row-oriented binary encoding against a declared writer schema. Pass a record object or pre-encoded Avro bytes. Currently available in the Rust, Python, Java, and TypeScript SDKs; support in the other SDKs is in development.
+- Arrow Flight: Apache Arrow `RecordBatch` data over the Arrow Flight protocol. Best when the workload is columnar or batched, or the application already produces Arrow (pyarrow, [arrow-rs](https://github.com/apache/arrow-rs), DataFusion, Polars).
 
-Supported by all SDKs. Records are sent over a gRPC stream in one of two serialization formats:
+JSON, Protocol Buffers, and Avro use one row-based stream API; Arrow Flight is a separate columnar API. Availability per SDK is below — Avro is beta and still rolling out.
 
-- **JSON** - Simple, schema-free ingestion. Pass a JSON string or native object (dict, map, etc.) and the SDK serializes it. No compilation step required. Good for getting started or dynamic schemas.
-- **Protocol Buffers** - Strongly-typed, schema-validated ingestion. More efficient over the wire. Recommended for production workloads.
+| SDK | JSON / Protobuf | Avro (beta) | Arrow Flight |
+| --- | --- | --- | --- |
+| Rust | Available | Beta | Available since 2.8.0 |
+| Python | Available | Beta | Available since 1.8.0 |
+| Go (cgo) | Available | In development | Available since 1.6.0 |
+| Pure Go | Available | In development | Not available |
+| TypeScript | Available | Beta | Available since 1.3.0 |
+| Java | Available | Beta | Available since 1.6.0 |
+| C++ | Available | In development | Available since 0.3.0 |
+| .NET (C#) | Available | In development | Not available |
 
-#### Protocol Buffers
+### JSON and Protocol Buffers ingestion
 
-Use `proto2` syntax with `optional` fields to correctly represent nullable Delta table columns.
+Records are sent as JSON or Protocol Buffers on the same stream API.
 
-##### Delta → Protobuf Type Mappings
+For Protocol Buffers, use `proto2` syntax with `optional` fields so nullable Delta table columns are represented correctly. Instead of writing `.proto` files by hand, each SDK ships a tool that generates a protobuf schema from an existing Unity Catalog table. See the individual SDK READMEs for language-specific usage.
 
-| Delta Type                          | Proto2 Type          |
-| ----------------------------------- | -------------------- |
-| TINYINT, BYTE, INT, SMALLINT, SHORT | int32                |
-| BIGINT, LONG                        | int64                |
-| FLOAT                               | float                |
-| DOUBLE                              | double               |
-| STRING, VARCHAR                     | string               |
-| BOOLEAN                             | bool                 |
-| BINARY                              | bytes                |
-| DATE                                | int32                |
-| TIMESTAMP, TIMESTAMP_NTZ            | int64                |
-| ARRAY\<type\>                       | repeated type        |
-| MAP\<key, value\>                   | map\<key, value\>    |
-| STRUCT\<fields\>                    | nested message       |
-| VARIANT                             | string (JSON string) |
+### Avro ingestion (beta)
 
-#### Schema Generation
+Send records encoded against a declared Avro writer schema on the same row-based stream API — pass a record object the SDK encodes against the schema, or pre-encoded Avro bytes. Currently available in the Rust, Python, Java, and TypeScript SDKs; support in the other SDKs is in development. The Java SDK's Avro support requires Java 11+ and the `org.apache.avro:avro` dependency. See each SDK's README for language-specific usage.
 
-Instead of writing `.proto` files by hand, each SDK ships a tool to generate protobuf schemas directly from an existing Unity Catalog table. See the individual SDK READMEs for language-specific usage.
+### Arrow Flight ingestion
 
-### Arrow Flight ingestion (Beta)
+Send Apache Arrow `RecordBatch` data directly to Zerobus. A good fit when:
 
-Available in the Rust, Python, Go, TypeScript, and Java SDKs starting from their 2.0.0 releases, and in the C++ SDK from its initial `0.1.0` release. Currently in Beta — the API is stabilising but may still change before reaching GA. A third record format option alongside JSON and Protocol Buffers: send Apache Arrow `RecordBatch` data directly to Zerobus over the Arrow Flight protocol, on the same gRPC connection. Best fit when:
+- The workload is naturally columnar or batched — analytics pipelines, gateways aggregating short windows of rows, wide or numeric schemas where row-by-row serialization adds noticeable CPU overhead.
+- The application already produces Arrow data — pyarrow, the [arrow-rs](https://github.com/apache/arrow-rs) crates, DataFusion, Polars, or other libraries built on Arrow.
 
-- Your workload is naturally columnar or batched — analytics pipelines, gateways aggregating short windows of rows, wide/numeric schemas where row-by-row serialization adds noticeable CPU overhead.
-- Your application already produces Arrow data — pyarrow, the [arrow-rs](https://github.com/apache/arrow-rs) crates, DataFusion, Polars, or other libraries built on Arrow.
+For sparse, one-row-at-a-time traffic, JSON or Protocol Buffers are usually simpler. Most SDKs that expose Arrow Flight ship a runnable `examples/arrow/` directory; see each SDK's README for details.
 
-For sparse, one-row-at-a-time traffic, JSON or Protocol Buffers over the standard SDK gRPC path are usually simpler. Most SDKs ship a runnable `examples/arrow/` directory (see each SDK's README for details).
+### Type mappings
+
+Delta column types map to Arrow and proto2 as shown below. JSON is not a typed mapping: objects use the same logical types as the table, and the SDK serializes them without a compiled schema.
+
+For Protocol Buffers, declare fields `optional` when the Delta column is nullable.
+
+| Delta Type | Arrow Type | Proto2 Type |
+| --- | --- | --- |
+| TINYINT, BYTE | `Int8` | `int32` |
+| SMALLINT, SHORT | `Int16` | `int32` |
+| INT | `Int32` | `int32` |
+| BIGINT, LONG | `Int64` | `int64` |
+| FLOAT | `Float32` | `float` |
+| DOUBLE | `Float64` | `double` |
+| STRING, VARCHAR | `LargeUtf8` | `string` |
+| BOOLEAN | `Boolean` | `bool` |
+| BINARY | `LargeBinary` | `bytes` |
+| DECIMAL | `LargeUtf8` | `string` |
+| DATE | `Date32` | `int32` (days since Unix epoch) |
+| TIMESTAMP | `Timestamp(Microsecond, UTC)` | `int64` (microseconds since Unix epoch) |
+| TIMESTAMP_NTZ | `Timestamp(Microsecond)` (no timezone) | `int64` (microseconds since Unix epoch) |
+| ARRAY\<type\> | `List` (item field `item`) | `repeated` type |
+| MAP\<key, value\> | `Map` (entries field `entries` with `keys` and `values`) | `map<key, value>` |
+| STRUCT\<fields\> | nested struct | nested message |
+| VARIANT | struct of `metadata` and `value`, both non-null `LargeBinary` | `string` (JSON) |
+
+DECIMAL is encoded as text on both paths today (`LargeUtf8` / `string`). STRING maps to Arrow `LargeUtf8`, not `Utf8`.
 
 ### Acknowledgments and throughput
 

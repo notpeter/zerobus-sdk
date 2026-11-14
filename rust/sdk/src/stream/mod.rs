@@ -1,7 +1,7 @@
 //! Ingestion streams, organized per transport.
 //!
-//! [`grpc`] holds proto / JSON streaming over a bidirectional gRPC stream.
-//! [`arrow`] holds Arrow Flight streaming (Beta).
+//! [`grpc`] holds JSON and Protocol Buffer streaming.
+//! [`arrow`] holds Arrow Flight streaming.
 //!
 //! TODO: lift the transport-agnostic parts of `grpc/` (callbacks,
 //! `flush` / `wait_for_offset` / `close`, `ingest_*`) into a shared core.
@@ -17,8 +17,8 @@ pub(crate) use arrow::c_data as arrow_c_data;
 pub(crate) use arrow::ArrowTableProperties;
 #[cfg(feature = "arrow-flight")]
 pub use arrow::{
-    ArrowSchema, ArrowStreamConfigurationOptions, DataType, Field, RecordBatch, TimeUnit,
-    ZerobusArrowStream,
+    ArrowCompression, ArrowDictionaryHandling, ArrowSchema, ArrowStreamConfigurationOptions,
+    DataType, Field, RecordBatch, TimeUnit, ZerobusArrowStream,
 };
 
 pub use grpc::ZerobusStream;

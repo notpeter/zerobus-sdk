@@ -1,6 +1,6 @@
 # NEXT CHANGELOG
 
-## Release v2.8.0
+## Release v3.3.0
 
 ### Major Changes
 
@@ -19,6 +19,3 @@
 ### Deprecations
 
 ### API Changes
-
-- Added the in-development persistent-stream protobuf contract for creating,
-  resuming, ingesting into, and retiring durable streams.

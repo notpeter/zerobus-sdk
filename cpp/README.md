@@ -11,8 +11,8 @@ every other Zerobus SDK.
 - **Proto and JSON** ingestion, single and batched.
 - **Dynamic protobuf** — build a descriptor and encode records straight from
   Unity Catalog table metadata, with no `.proto` file or `protoc` required.
-- **Arrow Flight** ingestion (Beta) — stream Arrow record batches with optional
-  LZ4/ZSTD compression.
+- **Arrow Flight** ingestion — streaming of Arrow record batches with ZSTD
+  compression by default (LZ4 or none optional).
 - **Async ack callback** — register an `AckCallback` to be notified of durable
   acks and terminal errors on a background task, without blocking in
   `wait_for_offset()` / `flush()`.
@@ -131,8 +131,8 @@ However you link it, include the umbrella header:
 A record-oriented `Stream` accepts two wire formats (proto and JSON), and there
 are three ways to get your data onto one. They differ only in how the record
 schema is handled — the streaming, auth, and recovery machinery is identical.
-(For columnar data there is also a separate [Arrow Flight
-stream](#arrow-flight-ingestion-beta), Beta.)
+For columnar data, use a separate [Arrow Flight
+stream](#arrow-flight-ingestion).
 
 | Path | Format | Schema source | Extra build deps | Best for |
 |------|--------|---------------|------------------|----------|
@@ -175,14 +175,18 @@ the last offset, not each one.
 
 ## Quickstart
 
+In these snippets, `server_endpoint` is your Zerobus server endpoint and `workspace_url` is your
+workspace URL. See the [connection URL table](https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id)
+for the format on each cloud.
+
 ### JSON ingestion
 
 ```cpp
 #include "zerobus/zerobus.hpp"
 
 zerobus::Sdk sdk = zerobus::Sdk::builder()
-                       .endpoint("https://<id>.zerobus.<region>.cloud.databricks.com")
-                       .unity_catalog_url("https://<workspace>.cloud.databricks.com")
+                       .endpoint(server_endpoint)
+                       .unity_catalog_url(workspace_url)
                        .application_name("my-app")
                        .build();
 
@@ -229,7 +233,7 @@ stream.ingest_proto_records(batch);
 stream.flush();
 ```
 
-### Arrow Flight ingestion (Beta)
+### Arrow Flight ingestion
 
 Stream Arrow record batches instead of proto/JSON records. Create the stream
 with an Arrow IPC stream that encodes only the schema, then ingest each batch as
@@ -247,8 +251,7 @@ stream.flush();                     // wait once for all pending acks
 stream.close();
 ```
 
-Optional LZ4/ZSTD compression is set via `ArrowStreamOptions::ipc_compression`.
-Arrow Flight is **Beta** — the API may change.
+Arrow IPC payloads are compressed with ZSTD by default. To use LZ4 or send uncompressed payloads, set `ArrowStreamOptions::ipc_compression`.
 
 ### Custom authentication
 
@@ -322,7 +325,7 @@ canonical version):
 |------|---------|
 | `zerobus::Sdk` / `zerobus::SdkBuilder` | Connection factory; creates streams |
 | `zerobus::Stream` | Proto/JSON ingestion stream |
-| `zerobus::ArrowStream` | Arrow Flight ingestion stream (Beta) |
+| `zerobus::ArrowStream` | Arrow Flight ingestion stream |
 | `zerobus::ProtoSchema` | UC table metadata → descriptor + JSON encoder |
 | `zerobus::HeadersProvider` | Custom authentication headers |
 | `zerobus::AckCallback` | Async ack/error notifications (`AckCallback::from` adapts lambdas) |
@@ -335,6 +338,18 @@ Key `Stream` methods: `ingest_proto_record`, `ingest_json_record`,
 `get_unacked_records`, `close`.
 
 ## Configuration
+
+`SdkBuilder::connection_per_stream(bool)` controls connection ownership for
+JSON/protobuf streams. It defaults to `true`, giving every stream a dedicated
+gRPC connection; pass `false` to multiplex streams over one shared HTTP/2
+connection. Arrow Flight streams are unaffected.
+
+HTTP/2 multiplexes logical streams over one TCP connection. On high-throughput
+workloads over the public internet, packet loss and TCP retransmissions can
+cause head-of-line blocking across every stream on that connection, reducing
+aggregate throughput. Dedicated connections isolate that loss. For many
+smaller, low-throughput streams, shared multiplexing is recommended to reduce
+connection overhead.
 
 Both option structs are plain aggregates — default-construct one and override
 only the fields you care about:
@@ -366,7 +381,7 @@ the FFI defaults.
 | `callback_wait_policy` | `CallbackWaitPolicy` | `use_default()` | How long `close()` drains the async ack-callback task: `use_default()` (finite FFI budget), `duration(ms)`, or `forever()` (block until callbacks finish). See [Async ack callback](#async-ack-callback) |
 | `ack_callback` | `std::shared_ptr<AckCallback>` | `nullptr` | Optional async ack/error callback; `nullptr` = none. See [Async ack callback](#async-ack-callback) |
 
-### `ArrowStreamOptions` (Arrow Flight streams, Beta)
+### `ArrowStreamOptions` (Arrow Flight streams)
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -378,14 +393,14 @@ the FFI defaults.
 | `server_lack_of_ack_timeout_ms` | `std::uint64_t` | 60,000 | How long to wait for a server ack before the stream is considered stalled (ms) |
 | `flush_timeout_ms` | `std::uint64_t` | 300,000 | Time budget for `flush()` / `close()` (ms) |
 | `connection_timeout_ms` | `std::uint64_t` | 30,000 | Connection establishment timeout (ms) |
-| `ipc_compression` | `IpcCompression` | `IpcCompression::NoCompression` | Arrow IPC compression codec (`NoCompression`, `Lz4Frame`, or `Zstd`) |
+| `ipc_compression` | `IpcCompression` | `IpcCompression::Zstd` | Arrow IPC compression codec (`Zstd`, `Lz4Frame`, or `NoCompression`) |
 | `stream_paused_max_wait_time_ms` | `std::optional<std::uint64_t>` | `nullopt` | Max wait during a server-initiated pause before recovering (same semantics as above) |
 
 ## Examples
 
 Runnable examples live under [`examples/`](examples/README.md), covering all
 three record formats — JSON and protobuf (dynamic schema from Unity Catalog),
-each with a single-record and a batch variant, plus Arrow Flight (Beta). Every
+each with a single-record and a batch variant, plus Arrow Flight. Every
 example reads its connection settings from the environment
 (`ZEROBUS_SERVER_ENDPOINT`, `DATABRICKS_WORKSPACE_URL`, `ZEROBUS_TABLE_NAME`,
 `DATABRICKS_CLIENT_ID`, `DATABRICKS_CLIENT_SECRET`). They build as part of the
@@ -418,7 +433,7 @@ schema, authenticated with the OAuth client credentials. It lives in the
 ```bash
 cd ../rust/tools/generate_files
 cargo run -- \
-  --uc-endpoint "https://<workspace>.cloud.databricks.com" \
+  --uc-endpoint "<your-databricks-workspace-url>" \
   --client-id "$DATABRICKS_CLIENT_ID" \
   --client-secret "$DATABRICKS_CLIENT_SECRET" \
   --table "catalog.schema.table" \

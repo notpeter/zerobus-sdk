@@ -4,14 +4,19 @@
 //! until acknowledgment, replay elimination, or terminal finalization.
 
 use std::io::Cursor;
+use std::sync::atomic::AtomicU32;
+use std::sync::Arc;
 
-use arrow_ipc::{reader::StreamReader, writer::IpcWriteOptions, CompressionType};
+use arrow_ipc::{reader::StreamReader, writer::IpcWriteOptions, CompressionType, MetadataVersion};
 use bytes::Bytes;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::{Duration, Instant};
 use tracing::debug;
 
-use super::{configured_deadline, RecordBatch};
+use super::{
+    configured_deadline, ArrowCompression, ArrowStreamConfigurationOptions, OutboundBatch,
+    RecordBatch,
+};
 use crate::errors::ZerobusError;
 use crate::offset_generator::OffsetId;
 use crate::ZerobusResult;
@@ -29,8 +34,12 @@ pub(super) struct PendingBatch {
     /// Time this batch most recently became pending on the active connection.
     /// Only replay onto a replacement connection refreshes this timestamp.
     enqueued_at: Instant,
+    /// Shared with outbound copies across reconnects. The encoder advances this
+    /// counter on the first data frame, so preparing or queuing a replay does not
+    /// count as a transmission. Absent when telemetry is disabled.
+    send_attempts: Option<Arc<AtomicU32>>,
     /// Backpressure permit; dropping it frees one `max_inflight_batches` slot.
-    permit: OwnedSemaphorePermit,
+    _permit: OwnedSemaphorePermit,
 }
 
 /// Stable identity used to confirm that a fired ACK deadline still belongs to the
@@ -55,24 +64,7 @@ impl PendingBatch {
         offset_id: OffsetId,
         start_record: u64,
         end_record: u64,
-        permit: OwnedSemaphorePermit,
-    ) -> Self {
-        Self::new_at(
-            batch,
-            offset_id,
-            start_record,
-            end_record,
-            Instant::now(),
-            permit,
-        )
-    }
-
-    fn new_at(
-        batch: RecordBatch,
-        offset_id: OffsetId,
-        start_record: u64,
-        end_record: u64,
-        enqueued_at: Instant,
+        send_attempts: Option<Arc<AtomicU32>>,
         permit: OwnedSemaphorePermit,
     ) -> Self {
         Self {
@@ -80,13 +72,18 @@ impl PendingBatch {
             offset_id,
             start_record,
             end_record,
-            enqueued_at,
-            permit,
+            enqueued_at: Instant::now(),
+            send_attempts,
+            _permit: permit,
         }
     }
 
     pub(super) fn offset_id(&self) -> OffsetId {
         self.offset_id
+    }
+
+    pub(super) fn send_attempts(&self) -> Option<Arc<AtomicU32>> {
+        self.send_attempts.clone()
     }
 
     pub(super) fn is_fully_acknowledged(&self, acked_records: u64) -> bool {
@@ -199,12 +196,12 @@ pub(super) fn refresh_pending_ack_deadlines(
 pub(super) fn rebuild_pending_for_replay(
     pending: &mut Vec<PendingBatch>,
     acked_before_disconnect: u64,
-) -> (Vec<RecordBatch>, u64) {
+) -> (Vec<OutboundBatch>, u64) {
     let mut rebuilt = Vec::with_capacity(pending.len());
     let mut replay = Vec::with_capacity(pending.len());
     let mut cumulative_records = 0;
 
-    for pending_batch in pending.drain(..) {
+    for mut pending_batch in pending.drain(..) {
         let Some(batch) = pending_batch.unacknowledged_suffix(acked_before_disconnect) else {
             debug!(target: super::LOG_TARGET, offset_id = pending_batch.offset_id, "Skipping fully-acked batch");
             continue;
@@ -214,16 +211,15 @@ pub(super) fn rebuild_pending_for_replay(
         let start_record = cumulative_records;
         let end_record = cumulative_records + record_count;
         cumulative_records = end_record;
-
-        replay.push(batch.clone());
-        rebuilt.push(PendingBatch::new_at(
-            batch,
-            pending_batch.offset_id,
-            start_record,
-            end_record,
-            pending_batch.enqueued_at,
-            pending_batch.permit,
-        ));
+        replay.push(OutboundBatch {
+            offset: pending_batch.offset_id,
+            send_attempts: pending_batch.send_attempts(),
+            batch: batch.clone(),
+        });
+        pending_batch.batch = batch;
+        pending_batch.start_record = start_record;
+        pending_batch.end_record = end_record;
+        rebuilt.push(pending_batch);
     }
 
     *pending = rebuilt;
@@ -260,20 +256,53 @@ pub(super) fn materialize_ipc(bytes: &Bytes) -> ZerobusResult<RecordBatch> {
     }
 }
 
+/// Alignment of IPC buffers in compressed payloads, the smallest that the IPC format allows.
+const COMPRESSED_IPC_ALIGNMENT: usize = 8;
+
 /// Builds [`IpcWriteOptions`] for the given optional compression codec.
+///
+/// With compression, 64-byte alignment gives readers no benefit, so compressed payloads
+/// use [`COMPRESSED_IPC_ALIGNMENT`].
 #[allow(clippy::result_large_err)]
 pub(super) fn make_ipc_write_options(
     compression: Option<CompressionType>,
 ) -> ZerobusResult<IpcWriteOptions> {
     match compression {
         None => Ok(IpcWriteOptions::default()),
-        Some(c) => IpcWriteOptions::default()
-            .try_with_compression(Some(c))
-            .map_err(|e| {
-                ZerobusError::InvalidArgument(format!(
-                    "Failed to enable Arrow IPC compression: {e}"
-                ))
-            }),
+        Some(c) => compact_ipc_write_options(Some(c)),
+    }
+}
+
+/// Builds V5 [`IpcWriteOptions`] with [`COMPRESSED_IPC_ALIGNMENT`] and the given buffer codec.
+#[allow(clippy::result_large_err)]
+fn compact_ipc_write_options(
+    compression: Option<CompressionType>,
+) -> ZerobusResult<IpcWriteOptions> {
+    IpcWriteOptions::try_new(COMPRESSED_IPC_ALIGNMENT, false, MetadataVersion::V5)
+        .and_then(|options| options.try_with_compression(compression))
+        .map_err(|e| {
+            ZerobusError::InvalidArgument(format!(
+                "Failed to configure Arrow IPC write options: {e}"
+            ))
+        })
+}
+
+/// Builds the [`IpcWriteOptions`] a stream encodes its batches with.
+///
+/// With gRPC compression, each whole message is compressed, so buffers are left raw:
+/// compressing them twice doesn't reduce size. They still use [`COMPRESSED_IPC_ALIGNMENT`],
+/// because wider padding only adds bytes.
+#[allow(clippy::result_large_err)]
+pub(super) fn stream_ipc_write_options(
+    options: &ArrowStreamConfigurationOptions,
+) -> ZerobusResult<IpcWriteOptions> {
+    match options.compression {
+        #[allow(deprecated)]
+        ArrowCompression::FallbackToLegacy => make_ipc_write_options(options.ipc_compression),
+        ArrowCompression::Uncompressed => make_ipc_write_options(None),
+        ArrowCompression::IpcZstd => make_ipc_write_options(Some(CompressionType::ZSTD)),
+        ArrowCompression::IpcLz4 => make_ipc_write_options(Some(CompressionType::LZ4_FRAME)),
+        ArrowCompression::GrpcZstd => compact_ipc_write_options(None),
     }
 }
 
@@ -282,15 +311,19 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::Int32Array;
+    use arrow_flight::encode::FlightDataEncoderBuilder;
+    use arrow_ipc::CompressionType;
     use arrow_schema::{DataType, Field, Schema};
+    use futures::TryStreamExt;
     use tokio::sync::Semaphore;
     use tokio::time::{Duration, Instant};
 
     use crate::ZerobusError;
 
     use super::{
-        oldest_pending_ack_deadline, rebuild_pending_for_replay, refresh_pending_ack_deadlines,
-        PendingBatch, RecordBatch,
+        make_ipc_write_options, oldest_pending_ack_deadline, rebuild_pending_for_replay,
+        refresh_pending_ack_deadlines, stream_ipc_write_options, ArrowCompression,
+        ArrowStreamConfigurationOptions, PendingBatch, RecordBatch,
     };
 
     #[allow(clippy::manual_div_ceil)]
@@ -320,6 +353,7 @@ mod tests {
             0,
             start_record,
             end_record,
+            None,
             Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
         )
     }
@@ -376,5 +410,118 @@ mod tests {
             }
             other => panic!("expected an invalid-argument error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn zstd_ipc_buffers_are_8_byte_aligned() {
+        let batch =
+            RecordBatch::try_from_iter([("a", Arc::new(Int32Array::from(vec![1, 2, 3])) as _)])
+                .unwrap();
+        let frames: Vec<_> = FlightDataEncoderBuilder::new()
+            .with_options(make_ipc_write_options(Some(CompressionType::ZSTD)).unwrap())
+            .build(futures::stream::iter([Ok(batch)]))
+            .try_collect()
+            .await
+            .unwrap();
+        let message = arrow_ipc::root_as_message(&frames[1].data_header).unwrap();
+        let buffers = message.header_as_record_batch().unwrap().buffers().unwrap();
+        assert!(buffers.iter().all(|b| b.offset() % 8 == 0));
+        assert!(buffers.iter().any(|b| b.offset() % 64 != 0));
+    }
+
+    /// Encodes a small batch with a stream's IPC options and returns the record-batch
+    /// message's buffer offsets and its IPC compression codec, if any.
+    async fn encode_with_stream_options(
+        options: &ArrowStreamConfigurationOptions,
+    ) -> (Vec<i64>, Option<CompressionType>) {
+        let batch =
+            RecordBatch::try_from_iter([("a", Arc::new(Int32Array::from(vec![1, 2, 3])) as _)])
+                .unwrap();
+        let frames: Vec<_> = FlightDataEncoderBuilder::new()
+            .with_options(stream_ipc_write_options(options).unwrap())
+            .build(futures::stream::iter([Ok(batch)]))
+            .try_collect()
+            .await
+            .unwrap();
+        let message = arrow_ipc::root_as_message(&frames[1].data_header).unwrap();
+        let record_batch = message.header_as_record_batch().unwrap();
+        let offsets = record_batch
+            .buffers()
+            .unwrap()
+            .iter()
+            .map(|b| b.offset())
+            .collect();
+        (offsets, record_batch.compression().map(|c| c.codec()))
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn compression_overrides_deprecated_ipc_compression() {
+        let cases = [
+            (ArrowCompression::Uncompressed, None),
+            (ArrowCompression::IpcZstd, Some(CompressionType::ZSTD)),
+            (ArrowCompression::IpcLz4, Some(CompressionType::LZ4_FRAME)),
+            (ArrowCompression::GrpcZstd, None),
+        ];
+        for (compression, expected_codec) in cases {
+            for ipc_compression in [
+                None,
+                Some(CompressionType::ZSTD),
+                Some(CompressionType::LZ4_FRAME),
+            ] {
+                let options = ArrowStreamConfigurationOptions {
+                    ipc_compression,
+                    compression,
+                    ..Default::default()
+                };
+                let (_, codec) = encode_with_stream_options(&options).await;
+                assert_eq!(
+                    codec, expected_codec,
+                    "{compression:?}, {ipc_compression:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn compressed_and_grpc_zstd_payloads_use_8_byte_alignment() {
+        for compression in [
+            ArrowCompression::IpcZstd,
+            ArrowCompression::IpcLz4,
+            ArrowCompression::GrpcZstd,
+        ] {
+            let options = ArrowStreamConfigurationOptions {
+                compression,
+                ..Default::default()
+            };
+            let (offsets, _) = encode_with_stream_options(&options).await;
+            assert!(offsets.iter().all(|o| o % 8 == 0), "{compression:?}");
+            assert!(offsets.iter().any(|o| o % 64 != 0), "{compression:?}");
+        }
+
+        let uncompressed = ArrowStreamConfigurationOptions {
+            compression: ArrowCompression::Uncompressed,
+            ..Default::default()
+        };
+        let (offsets, _) = encode_with_stream_options(&uncompressed).await;
+        assert!(offsets.iter().all(|o| o % 64 == 0));
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn fallback_to_legacy_applies_deprecated_ipc_compression() {
+        let default = ArrowStreamConfigurationOptions::default();
+        assert_eq!(
+            encode_with_stream_options(&default).await.1,
+            Some(CompressionType::ZSTD)
+        );
+
+        let uncompressed = ArrowStreamConfigurationOptions {
+            ipc_compression: None,
+            ..Default::default()
+        };
+        let (offsets, codec) = encode_with_stream_options(&uncompressed).await;
+        assert_eq!(codec, None);
+        assert!(offsets.iter().all(|o| o % 64 == 0));
     }
 }

@@ -17,10 +17,12 @@ use crate::{
 ///
 /// ```no_run
 /// use databricks_zerobus_ingest_sdk::ZerobusSdkBuilder;
+/// let server_endpoint = std::env::var("ZEROBUS_SERVER_ENDPOINT").expect("endpoint must be set");
+/// let workspace_url = std::env::var("DATABRICKS_WORKSPACE_URL").expect("workspace URL must be set");
 ///
 /// let sdk = ZerobusSdkBuilder::new()
-///     .endpoint("https://workspace.zerobus.databricks.com")
-///     .unity_catalog_url("https://workspace.cloud.databricks.com")
+///     .endpoint(server_endpoint)
+///     .unity_catalog_url(workspace_url)
 ///     .build()?;
 /// # Ok::<(), databricks_zerobus_ingest_sdk::ZerobusError>(())
 /// ```
@@ -33,6 +35,7 @@ pub struct ZerobusSdkBuilder {
     sdk_identifier_override: Option<String>,
     token_cache_enabled: bool,
     token_refresh_buffer: Duration,
+    connection_per_stream: bool,
 }
 
 impl ZerobusSdkBuilder {
@@ -49,6 +52,7 @@ impl ZerobusSdkBuilder {
             sdk_identifier_override: None,
             token_cache_enabled: true,
             token_refresh_buffer: DEFAULT_REFRESH_BUFFER,
+            connection_per_stream: true,
         }
     }
 
@@ -58,21 +62,24 @@ impl ZerobusSdkBuilder {
     ///
     /// # Arguments
     ///
-    /// * `endpoint` - The Zerobus endpoint URL (e.g., "https://workspace-id.zerobus.region.cloud.databricks.com")
+    /// * `endpoint` - The Zerobus endpoint URL. See the repository's
+    ///   [connection URL table](https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id).
     pub fn endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.zerobus_endpoint = Some(endpoint.into());
         self
     }
 
-    /// Sets the Unity Catalog endpoint URL.
+    /// Sets the Databricks workspace URL, used for Unity Catalog and OAuth.
     ///
-    /// This is only required when using OAuth authentication via `StreamBuilder::oauth()`.
-    /// When using `StreamBuilder::headers_provider()` with a custom headers
-    /// provider, this can be omitted.
+    /// This is required when using OAuth authentication via `StreamBuilder::oauth()`
+    /// or federated authentication via `StreamBuilder::federated_auth()` (the
+    /// RFC 8693 token exchange runs against this same URL). When using
+    /// `StreamBuilder::headers_provider()` with a custom headers provider, this
+    /// can be omitted.
     ///
     /// # Arguments
     ///
-    /// * `url` - The Unity Catalog URL (e.g., "https://workspace.cloud.databricks.com")
+    /// * `url` - The Databricks workspace URL used for Unity Catalog.
     pub fn unity_catalog_url(mut self, url: impl Into<String>) -> Self {
         self.unity_catalog_url = Some(url.into());
         self
@@ -105,6 +112,18 @@ impl ZerobusSdkBuilder {
     /// streams; see [`ConnectorFactory`] for semantics.
     pub fn connector_factory(mut self, factory: ConnectorFactory) -> Self {
         self.connector_factory = Some(factory);
+        self
+    }
+
+    /// Controls whether each ingestion stream gets a dedicated gRPC connection.
+    ///
+    /// This is enabled by default so streams created from the same SDK instance
+    /// do not compete for throughput on one HTTP/2 connection. Set it to `false`
+    /// to multiplex all JSON and protobuf streams from this SDK over one shared
+    /// connection. Arrow Flight streams already use dedicated connections and
+    /// are unaffected by this option.
+    pub fn connection_per_stream(mut self, enabled: bool) -> Self {
+        self.connection_per_stream = enabled;
         self
     }
 
@@ -157,15 +176,18 @@ impl ZerobusSdkBuilder {
         self
     }
 
-    /// Enables or disables caching of OAuth tokens for the default OAuth path.
+    /// Enables or disables token caching for the built-in OAuth and federated
+    /// authentication paths.
     ///
-    /// When enabled (the default), tokens obtained via `.oauth(...)` are cached
-    /// per table on the SDK instance and reused across stream creations and
-    /// recoveries until they near expiry, instead of minting a fresh token on
-    /// every stream. This reduces load on the Unity Catalog token endpoint for
-    /// clients that churn through many short-lived streams.
+    /// When enabled (the default), tokens obtained via `.oauth(...)` or
+    /// `.federated_auth(...)` are cached per table on the SDK instance and reused
+    /// across stream creations and recoveries until they near expiry, instead of
+    /// minting a fresh token on every stream. This reduces load on the Unity
+    /// Catalog token endpoint for clients that churn through many short-lived
+    /// streams.
     ///
-    /// Caching only applies to the built-in OAuth path. Custom
+    /// Caching applies to the built-in OAuth and federated paths, which share the
+    /// same per-table cache. Custom
     /// [`HeadersProvider`](crate::HeadersProvider) implementations are
     /// responsible for their own caching. Tokens are shared only across streams
     /// created from the same `ZerobusSdk` instance, so reuse the SDK rather than
@@ -173,18 +195,19 @@ impl ZerobusSdkBuilder {
     ///
     /// # Arguments
     ///
-    /// * `enabled` - Whether to cache OAuth tokens.
+    /// * `enabled` - Whether to cache tokens for the built-in OAuth and
+    ///   federated authentication paths.
     pub fn token_cache_enabled(mut self, enabled: bool) -> Self {
         self.token_cache_enabled = enabled;
         self
     }
 
-    /// Sets how long before a cached OAuth token's expiry it is refreshed.
+    /// Sets how long before a cached token's expiry it is refreshed.
     ///
-    /// A cached token is re-minted on the next stream creation once it is within
-    /// this buffer of its expiry, providing headroom against clock skew and
-    /// token propagation delays. Defaults to 5 minutes. Has no effect when token
-    /// caching is disabled.
+    /// Applies to both the OAuth and federated paths. A cached token is re-minted
+    /// on the next stream creation once it is within this buffer of its expiry,
+    /// providing headroom against clock skew and token propagation delays.
+    /// Defaults to 5 minutes. Has no effect when token caching is disabled.
     ///
     /// # Arguments
     ///
@@ -273,6 +296,7 @@ impl ZerobusSdkBuilder {
             sdk_identifier,
             self.token_cache_enabled,
             self.token_refresh_buffer,
+            self.connection_per_stream,
         ))
     }
 }
@@ -328,6 +352,27 @@ mod tests {
             .expect("should build");
         // The cache is always present; enablement is internal state.
         let _ = &sdk.token_cache;
+    }
+
+    #[test]
+    fn test_connection_per_stream_enabled_by_default() {
+        let sdk = ZerobusSdkBuilder::new()
+            .endpoint("https://workspace.zerobus.databricks.com")
+            .build()
+            .expect("should build");
+
+        assert!(sdk.connection_per_stream);
+    }
+
+    #[test]
+    fn test_connection_per_stream_can_be_disabled() {
+        let sdk = ZerobusSdkBuilder::new()
+            .endpoint("https://workspace.zerobus.databricks.com")
+            .connection_per_stream(false)
+            .build()
+            .expect("should build");
+
+        assert!(!sdk.connection_per_stream);
     }
 
     #[test]

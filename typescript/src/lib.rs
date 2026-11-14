@@ -18,7 +18,6 @@ use napi::{Env, JsFunction, JsGlobal, JsObject, JsString, JsUnknown, ValueType};
 use napi_derive::napi;
 
 use async_trait::async_trait;
-use databricks_zerobus_ingest_sdk::databricks::zerobus::RecordType as RustRecordType;
 use databricks_zerobus_ingest_sdk::{
     DefaultTokenFactory, EncodedRecord as RustRecordPayload,
     HeadersProvider as RustHeadersProvider, ZerobusError as RustZerobusError,
@@ -37,11 +36,14 @@ const TS_SDK_USER_AGENT: &str = concat!("zerobus-sdk-ts/", env!("CARGO_PKG_VERSI
 ///
 /// Specifies how records should be encoded when ingested into the stream.
 #[napi]
+#[derive(PartialEq, Eq)]
 pub enum RecordType {
     /// JSON encoding - records are JSON-encoded strings
     Json = 0,
     /// Protocol Buffers encoding - records are binary protobuf messages
     Proto = 1,
+    /// Avro encoding - records are raw Avro binary datums (no framing)
+    Avro = 2,
 }
 
 /// Configuration options for the Zerobus stream.
@@ -77,9 +79,9 @@ pub struct StreamConfigurationOptions {
     /// Default: 60,000 (1 minute)
     pub server_lack_of_ack_timeout_ms: Option<u32>,
 
-    /// Record serialization format.
-    /// Use RecordType.Json for JSON encoding or RecordType.Proto for Protocol Buffers.
-    /// Default: RecordType.Proto (Protocol Buffers)
+    /// Record serialization format: RecordType.Json, RecordType.Proto, or RecordType.Avro.
+    /// Optional — the schema on TableProperties selects the format (avroSchema → Avro,
+    /// descriptor → Proto); when set this must agree with it. Default: RecordType.Proto.
     pub record_type: Option<i32>,
 
     /// Maximum wait time during graceful stream close in milliseconds.
@@ -106,6 +108,10 @@ pub struct TableProperties {
     /// Omitting this does not select JSON. The stream defaults to Protocol Buffers
     /// unless `record_type` is set to JSON.
     pub descriptor_proto: Option<String>,
+
+    /// Optional Avro writer schema (JSON); selects the Avro record format.
+    /// Mutually exclusive with `descriptor_proto`.
+    pub avro_schema: Option<String>,
 }
 
 /// Custom error type for Zerobus operations.
@@ -146,14 +152,33 @@ fn bigint_to_i64(value: BigInt) -> Result<i64> {
     Ok(n)
 }
 
-/// Helper function to convert a JavaScript value to a RustRecordPayload.
-///
-/// Supports:
-/// - Buffer (low-level proto bytes)
-/// - string (low-level JSON string)
-/// - Protobuf message object with .encode() method (high-level, auto-serializes)
-/// - Plain JavaScript object (high-level, auto-stringifies to JSON)
-fn convert_js_to_record_payload(env: &Env, payload: Unknown) -> Result<RustRecordPayload> {
+/// Converts a JavaScript value to a RustRecordPayload per the stream's `record_type`.
+/// Avro streams take a Buffer (objects are encoded to bytes by the JS wrapper first);
+/// Proto/JSON take a Buffer, string, protobuf message, or plain object.
+fn convert_js_to_record_payload(
+    env: &Env,
+    payload: Unknown,
+    record_type: RecordType,
+) -> Result<RustRecordPayload> {
+    if record_type == RecordType::Avro {
+        #[cfg(feature = "avro")]
+        {
+            if payload.is_buffer()? {
+                let buffer: Buffer = Buffer::from_unknown(payload)?;
+                return Ok(RustRecordPayload::Avro(buffer.to_vec()));
+            }
+            return Err(Error::from_reason(
+                "Avro stream expects pre-encoded bytes (Buffer); encode record objects via the SDK (requires `avsc`)",
+            ));
+        }
+        #[cfg(not(feature = "avro"))]
+        {
+            return Err(Error::from_reason(
+                "Avro support is not compiled in this build",
+            ));
+        }
+    }
+
     let value_type = payload.get_type()?;
 
     match value_type {
@@ -212,10 +237,24 @@ fn convert_js_to_record_payload(env: &Env, payload: Unknown) -> Result<RustRecor
     }
 }
 
+/// Converts an unacknowledged record to a Buffer (JSON strings become UTF-8 bytes).
+fn record_payload_to_buffer(record: RustRecordPayload) -> Result<Buffer> {
+    match record {
+        RustRecordPayload::Proto(vec) => Ok(vec.into()),
+        RustRecordPayload::Json(s) => Ok(s.into_bytes().into()),
+        #[cfg(feature = "avro")]
+        RustRecordPayload::Avro(vec) => Ok(vec.into()),
+        _ => Err(Error::from_reason(
+            "unacknowledged records include a record type the TypeScript API does not support",
+        )),
+    }
+}
+
 /// A stream for ingesting data into a Databricks Delta table.
 ///
-/// The stream manages a bidirectional gRPC connection, handles acknowledgments,
-/// and provides automatic recovery on transient failures.
+/// The stream manages JSON or Protocol Buffer ingestion over a bidirectional
+/// gRPC connection, handles acknowledgments, and provides automatic recovery
+/// on transient failures.
 ///
 /// # Example
 ///
@@ -228,6 +267,8 @@ fn convert_js_to_record_payload(env: &Env, payload: Unknown) -> Result<RustRecor
 #[napi]
 pub struct ZerobusStream {
     inner: Arc<Mutex<Option<RustZerobusStream>>>,
+    /// Record format, used to coerce ingest payloads; preserved across recovery.
+    record_type: RecordType,
 }
 
 #[napi]
@@ -272,7 +313,7 @@ impl ZerobusStream {
     #[napi(ts_return_type = "Promise<bigint>")]
     #[allow(deprecated)]
     pub fn ingest_record(&self, env: Env, payload: Unknown) -> Result<JsObject> {
-        let record_payload = convert_js_to_record_payload(&env, payload)?;
+        let record_payload = convert_js_to_record_payload(&env, payload, self.record_type)?;
         let stream = self.inner.clone();
 
         env.execute_tokio_future(
@@ -347,9 +388,10 @@ impl ZerobusStream {
         // Rust SDK 2.0 removed the blocking `ingest_records`. v1 semantics
         // (Promise resolves after server ack; `null` for empty batches) are
         // preserved via `ingest_records_offset` + `wait_for_offset`.
+        let record_type = self.record_type;
         let record_payloads: Result<Vec<RustRecordPayload>> = records
             .into_iter()
-            .map(|payload| convert_js_to_record_payload(&env, payload))
+            .map(|payload| convert_js_to_record_payload(&env, payload, record_type))
             .collect();
         let record_payloads = record_payloads?;
         let stream = self.inner.clone();
@@ -431,7 +473,7 @@ impl ZerobusStream {
     /// ```
     #[napi(ts_return_type = "Promise<bigint>")]
     pub fn ingest_record_offset(&self, env: Env, payload: Unknown) -> Result<JsObject> {
-        let record_payload = convert_js_to_record_payload(&env, payload)?;
+        let record_payload = convert_js_to_record_payload(&env, payload, self.record_type)?;
 
         let stream = self.inner.clone();
 
@@ -494,9 +536,10 @@ impl ZerobusStream {
     /// ```
     #[napi(ts_return_type = "Promise<bigint | null>")]
     pub fn ingest_records_offset(&self, env: Env, records: Vec<Unknown>) -> Result<JsObject> {
+        let record_type = self.record_type;
         let record_payloads: Result<Vec<RustRecordPayload>> = records
             .into_iter()
-            .map(|payload| convert_js_to_record_payload(&env, payload))
+            .map(|payload| convert_js_to_record_payload(&env, payload, record_type))
             .collect();
 
         let record_payloads = record_payloads?;
@@ -648,13 +691,7 @@ impl ZerobusStream {
             .await
             .map_err(|e| Error::from_reason(format!("Failed to get unacked records: {}", e)))?;
 
-        Ok(unacked
-            .into_iter()
-            .map(|payload| match payload {
-                RustRecordPayload::Proto(vec) => vec.into(),
-                RustRecordPayload::Json(s) => s.into_bytes().into(),
-            })
-            .collect())
+        unacked.into_iter().map(record_payload_to_buffer).collect()
     }
 
     /// Gets unacknowledged records grouped by their original batches.
@@ -694,18 +731,15 @@ impl ZerobusStream {
             .await
             .map_err(|e| Error::from_reason(format!("Failed to get unacked batches: {}", e)))?;
 
-        Ok(unacked_batches
+        unacked_batches
             .into_iter()
             .map(|batch| {
                 batch
                     .into_iter()
-                    .map(|record| match record {
-                        RustRecordPayload::Proto(vec) => vec.into(),
-                        RustRecordPayload::Json(s) => s.into_bytes().into(),
-                    })
-                    .collect()
+                    .map(record_payload_to_buffer)
+                    .collect::<Result<_>>()
             })
-            .collect())
+            .collect()
     }
 }
 
@@ -839,6 +873,9 @@ impl RustHeadersProvider for TsOAuthHeadersProvider {
 pub struct ZerobusSdkOptions {
     /// Identifier appended to the `user-agent` header
     pub application_name: Option<String>,
+    /// Whether every JSON/protobuf stream gets a dedicated gRPC connection.
+    /// Defaults to true.
+    pub connection_per_stream: Option<bool>,
 }
 
 /// The main SDK for interacting with the Databricks Zerobus service.
@@ -849,8 +886,8 @@ pub struct ZerobusSdkOptions {
 ///
 /// ```typescript
 /// const sdk = new ZerobusSdk(
-///   "https://workspace-id.zerobus.region.cloud.databricks.com",
-///   "https://workspace.cloud.databricks.com",
+///   process.env.ZEROBUS_SERVER_ENDPOINT!,
+///   process.env.DATABRICKS_WORKSPACE_URL!,
 ///   { applicationName: "my-app/1.0" }
 /// );
 ///
@@ -875,12 +912,12 @@ impl ZerobusSdk {
     ///
     /// # Arguments
     ///
-    /// * `zerobus_endpoint` - The Zerobus API endpoint URL
-    ///   (e.g., "https://workspace-id.zerobus.region.cloud.databricks.com")
-    /// * `unity_catalog_url` - The Unity Catalog endpoint URL
-    ///   (e.g., "https://workspace.cloud.databricks.com")
+    /// * `zerobus_endpoint` - The Zerobus API endpoint URL. See the repository's
+    ///   [connection URL table](https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id).
+    /// * `unity_catalog_url` - The Databricks workspace URL used for Unity Catalog.
     /// * `options` - Optional SDK configuration (see `ZerobusSdkOptions`),
-    ///   including `applicationName` for server-side attribution.
+    ///   including `applicationName` for server-side attribution and
+    ///   `connectionPerStream` for connection ownership.
     ///
     /// # Errors
     ///
@@ -909,6 +946,10 @@ impl ZerobusSdk {
             .endpoint(&zerobus_endpoint)
             .unity_catalog_url(&unity_catalog_url)
             .sdk_identifier(TS_SDK_USER_AGENT);
+        let builder = match options.connection_per_stream {
+            Some(enabled) => builder.connection_per_stream(enabled),
+            None => builder,
+        };
         let builder = match options.application_name {
             Some(name) => builder.application_name(name),
             None => builder,
@@ -926,7 +967,7 @@ impl ZerobusSdk {
 
     /// Creates a new ingestion stream to a Delta table.
     ///
-    /// This method establishes a bidirectional gRPC connection to the Zerobus service
+    /// This method opens a JSON or Protocol Buffer stream to the Zerobus service
     /// and prepares it for data ingestion. By default, it uses OAuth 2.0 Client Credentials
     /// authentication. For custom authentication (e.g., Personal Access Tokens), provide
     /// a custom headers_provider.
@@ -1014,10 +1055,35 @@ impl ZerobusSdk {
             stream_paused_max_wait_time_ms: None,
         });
 
-        let record_type = match opts.record_type {
-            Some(0) => RustRecordType::Json,
-            Some(1) => RustRecordType::Proto,
-            _ => RustRecordType::Proto,
+        // The schema selects the format (descriptor -> Proto, avro_schema -> Avro,
+        // neither -> JSON/Proto); an explicit record_type must agree with it.
+        let has_descriptor = descriptor_proto.is_some();
+        let avro_schema = table_properties.avro_schema.clone();
+
+        let record_type = if avro_schema.is_some() {
+            if has_descriptor {
+                return Err(Error::from_reason(
+                    "TableProperties.descriptorProto and avroSchema are mutually exclusive",
+                ));
+            }
+            match opts.record_type {
+                None | Some(2) => RecordType::Avro,
+                _ => {
+                    return Err(Error::from_reason(
+                        "avroSchema is set but recordType is not RecordType.Avro",
+                    ))
+                }
+            }
+        } else {
+            match opts.record_type {
+                Some(0) => RecordType::Json,
+                Some(2) => {
+                    return Err(Error::from_reason(
+                        "recordType is RecordType.Avro but no avroSchema was provided on TableProperties",
+                    ))
+                }
+                _ => RecordType::Proto,
+            }
         };
 
         let headers_tsfn = match headers_provider {
@@ -1084,8 +1150,23 @@ impl ZerobusSdk {
                 }
 
                 let builder = match record_type {
-                    RustRecordType::Json => builder.json(),
-                    RustRecordType::Proto | RustRecordType::Unspecified => {
+                    RecordType::Json => builder.json(),
+                    #[cfg(feature = "avro")]
+                    RecordType::Avro => {
+                        let schema = avro_schema.ok_or_else(|| {
+                            napi::Error::from_reason(
+                                "Avro record type requires avroSchema on TableProperties",
+                            )
+                        })?;
+                        builder.avro(schema)
+                    }
+                    #[cfg(not(feature = "avro"))]
+                    RecordType::Avro => {
+                        return Err(napi::Error::from_reason(
+                            "Avro support is not compiled in this build",
+                        ))
+                    }
+                    RecordType::Proto => {
                         let desc = descriptor_proto.ok_or_else(|| {
                             napi::Error::from_reason(
                                 "Proto record type requires descriptor_proto on TableProperties",
@@ -1101,6 +1182,7 @@ impl ZerobusSdk {
 
                 Ok(ZerobusStream {
                     inner: Arc::new(Mutex::new(Some(stream))),
+                    record_type,
                 })
             },
             |_env, stream| Ok(stream),
@@ -1168,6 +1250,7 @@ impl ZerobusSdk {
 
         Ok(ZerobusStream {
             inner: Arc::new(Mutex::new(Some(new_rust_stream))),
+            record_type: stream.record_type,
         })
     }
 }
@@ -1181,8 +1264,8 @@ fn base64_decode(input: &str) -> std::result::Result<Vec<u8>, String> {
 }
 
 // =============================================================================
-// Arrow Flight Support (Beta)
-// Enabled with feature flag: cargo build --features arrow-flight
+// Arrow Flight support
+// Behind the arrow-flight feature. Enable with: npm run build:arrow
 // =============================================================================
 
 #[cfg(feature = "arrow-flight")]
@@ -1191,27 +1274,25 @@ use arrow_ipc::writer::StreamWriter;
 use bytes::Bytes;
 #[cfg(feature = "arrow-flight")]
 use databricks_zerobus_ingest_sdk::{
-    ArrowSchema as RustArrowSchema, DataType as RustDataType, Field as RustField,
+    ArrowCompression, ArrowSchema as RustArrowSchema, DataType as RustDataType, Field as RustField,
     RecordBatch as RustRecordBatch, ZerobusArrowStream as RustZerobusArrowStream,
 };
 
 /// IPC compression type for Arrow Flight streams.
 ///
-/// **Beta**: Arrow Flight support is in Beta. The API is stabilising but
-/// may still change before reaching GA.
 #[cfg(feature = "arrow-flight")]
 #[napi]
 pub enum IpcCompressionType {
+    /// No compression - send uncompressed payloads
+    None = -1,
     /// LZ4 frame compression - fast compression with moderate ratio
     Lz4Frame = 0,
-    /// Zstandard compression - better compression ratio, slightly slower
+    /// Zstandard compression - better compression ratio, slightly slower. This is the default.
     Zstd = 1,
 }
 
 /// Configuration options for Arrow Flight streams.
 ///
-/// **Beta**: Arrow Flight support is in Beta. The API is stabilising but
-/// may still change before reaching GA.
 #[cfg(feature = "arrow-flight")]
 #[napi(object)]
 #[derive(Debug, Clone)]
@@ -1248,7 +1329,8 @@ pub struct ArrowStreamConfigurationOptions {
     /// Default: 30,000 (30 seconds)
     pub connection_timeout_ms: Option<u32>,
 
-    /// Optional IPC compression type (0 = LZ4Frame, 1 = Zstd, undefined = no compression)
+    /// IPC compression type (-1 = None, 0 = Lz4Frame, 1 = Zstd).
+    /// Default: Zstd
     pub ipc_compression: Option<i32>,
 }
 
@@ -1258,17 +1340,16 @@ pub struct ArrowStreamConfigurationOptions {
 // below.
 
 #[cfg(feature = "arrow-flight")]
-fn map_ipc_compression(value: Option<i32>) -> Option<arrow_ipc::CompressionType> {
+fn map_ipc_compression(value: Option<i32>) -> ArrowCompression {
     match value {
-        Some(0) => Some(arrow_ipc::CompressionType::LZ4_FRAME),
-        Some(1) => Some(arrow_ipc::CompressionType::ZSTD),
-        _ => None,
+        Some(-1) => ArrowCompression::Uncompressed,
+        Some(0) => ArrowCompression::IpcLz4,
+        _ => ArrowCompression::IpcZstd,
     }
 }
 
 /// Arrow data type enum for schema definition.
 ///
-/// **Beta**: Arrow Flight support is in Beta.
 #[cfg(feature = "arrow-flight")]
 #[napi]
 pub enum ArrowDataType {
@@ -1340,7 +1421,6 @@ fn convert_arrow_data_type(dt: i32) -> RustDataType {
 
 /// Arrow field definition for schema.
 ///
-/// **Beta**: Arrow Flight support is in Beta.
 #[cfg(feature = "arrow-flight")]
 #[napi(object)]
 #[derive(Debug, Clone)]
@@ -1358,8 +1438,6 @@ pub struct ArrowField {
 /// Unlike `TableProperties` which uses Protocol Buffers, Arrow Flight streams
 /// require an Arrow schema definition.
 ///
-/// **Beta**: Arrow Flight support is in Beta. The API is stabilising but
-/// may still change before reaching GA.
 #[cfg(feature = "arrow-flight")]
 #[napi(object)]
 #[derive(Debug, Clone)]
@@ -1392,9 +1470,6 @@ fn build_arrow_schema(fields: &[ArrowField]) -> Arc<RustArrowSchema> {
 ///
 /// This stream provides a high-performance interface for streaming Arrow data
 /// to Databricks Delta tables using the Arrow Flight protocol.
-///
-/// **Beta**: Arrow Flight support is in Beta. The API is stabilising but
-/// may still change before reaching GA.
 ///
 /// # Lifecycle
 ///
@@ -1617,9 +1692,6 @@ impl ZerobusArrowStream {
 impl ZerobusSdk {
     /// Creates a new Arrow Flight stream to a Delta table.
     ///
-    /// **Beta**: Arrow Flight support is in Beta. The API is stabilising
-    /// but may still change before reaching GA.
-    ///
     /// This method establishes an Arrow Flight connection to the Zerobus service
     /// for high-performance columnar data ingestion.
     ///
@@ -1716,7 +1788,7 @@ impl ZerobusSdk {
                 if let Some(v) = opts.connection_timeout_ms {
                     builder = builder.connection_timeout_ms(v as u64);
                 }
-                builder = builder.ipc_compression(ipc_compression);
+                builder = builder.compression(ipc_compression);
 
                 let stream = builder.build_arrow().await.map_err(|e| {
                     napi::Error::from_reason(format!("Failed to create arrow stream: {}", e))
@@ -1732,8 +1804,6 @@ impl ZerobusSdk {
     }
 
     /// Recreates an Arrow stream with the same configuration and re-ingests unacknowledged batches.
-    ///
-    /// **Beta**: Arrow Flight support is in Beta.
     ///
     /// # Arguments
     ///

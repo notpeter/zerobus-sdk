@@ -69,7 +69,7 @@ class CallbackWaitPolicy {
   State state_{Default{}};
 };
 
-/// Configuration for a gRPC ingestion stream.
+/// Configuration for a JSON or Protocol Buffer ingestion stream.
 ///
 /// The scalar defaults below are hand-kept in sync with the Rust core and sent
 /// to the FFI verbatim (see `to_c()`). `config_defaults_test` fails the build
@@ -115,7 +115,7 @@ enum class IpcCompression : std::int32_t {
   Zstd = 1,
 };
 
-/// Configuration for an Arrow Flight ingestion stream (Beta).
+/// Configuration for an Arrow Flight ingestion stream.
 ///
 /// The scalar defaults below are hand-kept in sync with the Rust core and sent
 /// to the FFI verbatim (see `to_c()`). `arrow_config_defaults_test` fails the
@@ -137,8 +137,9 @@ struct ArrowStreamOptions {
   std::uint64_t flush_timeout_ms = 300'000;
   /// Connection establishment timeout.
   std::uint64_t connection_timeout_ms = 30'000;
-  /// Arrow IPC compression codec.
-  IpcCompression ipc_compression = IpcCompression::NoCompression;
+  /// Arrow IPC compression codec. Use `NoCompression` to send uncompressed
+  /// payloads.
+  IpcCompression ipc_compression = IpcCompression::Zstd;
   /// Max wait during a server-initiated pause before recovering. `nullopt` =
   /// full server duration; `0` = recover immediately; `x` = min(x, server).
   std::optional<std::uint64_t> stream_paused_max_wait_time_ms;

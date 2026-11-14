@@ -15,12 +15,16 @@ namespace Databricks.Zerobus;
 /// <para>
 /// The SDK is thread-safe — you may create multiple streams from one instance.
 /// </para>
+/// <para>
+/// See the <see href="https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id">connection URL table</see>
+/// for cloud-specific endpoint formats.
+/// </para>
 /// </remarks>
 /// <example>
 /// <code>
 /// using var sdk = ZerobusSdk.CreateBuilder()
-///     .Endpoint("https://your-shard.zerobus.databricks.com")
-///     .UnityCatalogUrl("https://your-workspace.databricks.com")
+///     .Endpoint(serverEndpoint)
+///     .UnityCatalogUrl(workspaceUrl)
 ///     .Build();
 ///
 /// using var stream = sdk.CreateJsonStream(
@@ -52,8 +56,8 @@ public sealed class ZerobusSdk : IDisposable
     /// <example>
     /// <code>
     /// using var sdk = ZerobusSdk.CreateBuilder()
-    ///     .Endpoint("https://zerobus.databricks.com")
-    ///     .UnityCatalogUrl("https://workspace.databricks.com")
+    ///     .Endpoint(serverEndpoint)
+    ///     .UnityCatalogUrl(workspaceUrl)
     ///     .ApplicationName("my-service")
     ///     .Build();
     /// </code>
@@ -61,7 +65,7 @@ public sealed class ZerobusSdk : IDisposable
     public static ZerobusSdkBuilder CreateBuilder() => new();
 
     /// <summary>
-    /// Creates a new bidirectional gRPC stream for ingesting records into a Databricks table.
+    /// Creates a new JSON or Protocol Buffer stream for ingesting records into a Databricks table.
     /// Uses OAuth 2.0 client credentials flow for authentication.
     /// </summary>
     /// <param name="tableProperties">Table properties including name and optional protobuf descriptor.</param>
@@ -98,7 +102,7 @@ public sealed class ZerobusSdk : IDisposable
     }
 
     /// <summary>
-    /// Creates a new bidirectional gRPC stream asynchronously.
+    /// Creates a new JSON or Protocol Buffer stream asynchronously.
     /// </summary>
     public Task<ZerobusStream> CreateStreamAsync(
         TableProperties tableProperties,
@@ -269,7 +273,7 @@ public sealed class ZerobusSdk : IDisposable
     }
 
     /// <summary>
-    /// Creates a new bidirectional gRPC stream using a custom headers provider.
+    /// Creates a new JSON or Protocol Buffer stream using a custom headers provider.
     /// Use this for custom authentication logic (managed identity, vaults, etc.).
     /// </summary>
     /// <param name="tableProperties">Table properties including name and optional protobuf descriptor.</param>
@@ -303,7 +307,7 @@ public sealed class ZerobusSdk : IDisposable
     }
 
     /// <summary>
-    /// Creates a new bidirectional gRPC stream using a custom headers provider asynchronously.
+    /// Creates a new JSON or Protocol Buffer stream using a custom headers provider asynchronously.
     /// </summary>
     public Task<ZerobusStream> CreateStreamWithHeadersProviderAsync(
         TableProperties tableProperties,
@@ -490,7 +494,7 @@ public sealed class ZerobusSdk : IDisposable
     }
 
     /// <summary>
-    /// Recreates a new bidirectional gRPC stream from an existing stream.
+    /// Recreates a JSON or Protocol Buffer stream from an existing stream.
     /// This is used for recovery scenarios where a stream needs to be re-established
     /// using the existing stream's configuration and state.
     /// </summary>
@@ -523,7 +527,7 @@ public sealed class ZerobusSdk : IDisposable
     }
 
     /// <summary>
-    /// Recreates a new bidirectional gRPC stream asynchronously from an existing stream.
+    /// Recreates a JSON or Protocol Buffer stream asynchronously from an existing stream.
     /// </summary>
     public async Task<ZerobusStream> RecreateStreamAsync(
         ZerobusStream stream)

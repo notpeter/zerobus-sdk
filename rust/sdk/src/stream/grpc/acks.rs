@@ -10,9 +10,21 @@ use tokio::time::Duration;
 use tracing::{debug, error, instrument, trace};
 
 use super::ZerobusStream;
+use crate::grpc_status::GrpcStatus;
 use crate::{EncodedBatch, EncodedRecord, OffsetId, ZerobusError, ZerobusResult};
 
 impl ZerobusStream {
+    /// Once a stream has opened, a later stream-creation failure belongs to a
+    /// recovery attempt. Preserve its status while presenting it through the
+    /// established stream-operation error variant. The raw terminal cause stays
+    /// in `server_error_rx` for mux poisoning and internal diagnostics.
+    fn normalize_wait_error(error: ZerobusError) -> ZerobusError {
+        match error {
+            ZerobusError::CreateStreamError(status) => ZerobusError::StreamClosedError(status),
+            error => error,
+        }
+    }
+
     /// Internal method to wait for a specific offset to be acknowledged.
     /// Used by both `flush()` and `wait_for_offset()`.
     async fn wait_for_offset_internal(
@@ -59,13 +71,13 @@ impl ZerobusStream {
                             return Ok(());
                         }
                     }
-                    // The supervisor always sends the real error to server_error_tx
-                    // before setting is_closed=true, so check error_rx first to
-                    // return the actual error instead of a generic one.
+                    // fail_stream sets is_closed, publishes the error, then cancels
+                    // terminal_token. This path can observe closure before the final
+                    // watch value; the mux terminal-cause hook waits on the token before reading it.
                     if let Some(server_error) = error_rx.borrow().clone() {
-                        return Err(server_error);
+                        return Err(Self::normalize_wait_error(server_error));
                     }
-                    return Err(ZerobusError::StreamClosedError(tonic::Status::internal(
+                    return Err(ZerobusError::StreamClosedError(GrpcStatus::internal(
                         format!("Stream closed during {}", operation_name.to_lowercase()),
                     )));
                 }
@@ -89,7 +101,7 @@ impl ZerobusStream {
                                         return Ok(());
                                     }
                                 }
-                                return Err(server_error);
+                                return Err(Self::normalize_wait_error(server_error));
                             }
                         }
                     }
@@ -98,11 +110,11 @@ impl ZerobusStream {
 
             if let Some(server_error) = error_rx.borrow().clone() {
                 if self.is_closed.load(Ordering::Relaxed) {
-                    return Err(server_error);
+                    return Err(Self::normalize_wait_error(server_error));
                 }
             }
 
-            Err(ZerobusError::StreamClosedError(tonic::Status::internal(
+            Err(ZerobusError::StreamClosedError(GrpcStatus::internal(
                 format!("Stream closed during {}", operation_name.to_lowercase()),
             )))
         };
@@ -122,7 +134,7 @@ impl ZerobusStream {
                     error!(table_name = %self.table_properties.table_name, "{} timed out", operation_name);
                 }
                 Err(ZerobusError::StreamClosedError(
-                    tonic::Status::deadline_exceeded(format!("{} timed out", operation_name)),
+                    GrpcStatus::deadline_exceeded(format!("{} timed out", operation_name)),
                 ))
             }
         }
@@ -276,11 +288,9 @@ impl ZerobusStream {
     pub async fn get_unacked_batches(&self) -> ZerobusResult<Vec<EncodedBatch>> {
         if self.is_closed.load(Ordering::Relaxed) {
             // The supervisor only moves landing-zone records into
-            // `failed_records` on a stream failure. A stream torn down without
-            // one (flush timed out during `close`, or `signal_shutdown` from a
-            // poisoned MultiplexedStream) can still hold unacked records in the
-            // landing zone; drain them here so they are reported too and so
-            // repeat calls return the same result.
+            // `failed_records` on a stream failure. A close whose flush timed
+            // out can still leave unacked records in the landing zone; drain
+            // them here too and retain them so repeat calls return the same result.
             let mut failed = self.failed_records.write().await;
             failed.extend(
                 self.landing_zone

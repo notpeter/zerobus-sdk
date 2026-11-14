@@ -15,6 +15,7 @@ A high-performance Python client for streaming data ingestion into Databricks De
   - [JSON (Simplest)](#option-1-json-simplest)
   - [Protocol Buffers](#option-2-protocol-buffers)
   - [Acknowledgments and throughput](#acknowledgments-and-throughput)
+- [Persistent Streams](#persistent-streams)
 - [Configuration](#configuration)
 - [Error Handling](#error-handling)
 - [Handling Stream Failures](#handling-stream-failures)
@@ -61,7 +62,7 @@ The Zerobus Python SDK is a thin wrapper around the [Zerobus Rust SDK](../rust/)
 - **Rust-backed performance** - Native Rust implementation via PyO3 bindings for maximum throughput
 - **Sync and Async support** - Both synchronous and asynchronous Python APIs
 - **Automatic recovery** - Built-in retry and reconnection for transient failures
-- **Multiple serialization formats** - JSON (simple) and Protocol Buffers (type-safe)
+- **Multiple serialization formats** - JSON, Protocol Buffers, Avro, and Arrow Flight ingestion
 - **OAuth 2.0 authentication** - Secure authentication with client credentials, automatically refreshed
 - **Acknowledgment callbacks** - Receive notifications when records are acknowledged or encounter errors
 - **Flexible configuration** - Fine-tune timeouts, retries, and recovery behavior
@@ -107,26 +108,45 @@ installs `pyarrow` 22.0.0 or later, which is the first release with 3.14 wheels.
 On earlier versions it installs `pyarrow` below 22.0.0. Core ingestion (Protobuf
 and JSON) does not need `pyarrow` at all.
 
+Avro record format is built in (beta). Encoding **dict** records needs `fastavro`, installed
+with the `avro` extra; pre-encoded Avro bytes need no extra:
+
+```bash
+pip install "databricks-zerobus-ingest-sdk[avro]"
+```
+
 ## Quick Start
 
 ### Choose Your Serialization Format
 
 1. **Protocol Buffers** (Recommended) - Strongly-typed schemas with compact binary encoding. More efficient over the wire and the best choice for production and high-throughput workloads.
 2. **JSON** - Simple, no schema compilation needed. Good for getting started or quick prototyping, but each record carries higher per-record overhead (text serialization plus UTF-8 validation), so it is slower than Protocol Buffers for high-volume ingestion.
+3. **Avro** (beta) - Row-oriented binary encoding against a declared writer schema. See the [sync](examples/sync_example_avro.py) or [async](examples/async_example_avro.py) example.
+   - If you're sending **dict records**, they're encoded with `fastavro` — install the `avro` extra.
+   - If you're sending **pre-encoded Avro bytes**, they pass through unchanged — no extra needed.
+4. Arrow Flight - High-throughput columnar ingestion for applications that already produce Arrow data. Install the `arrow` extra and see the [sync](examples/sync_example_arrow.py) or [async](examples/async_example_arrow.py) example.
 
 ### Option 1: JSON (Simplest)
+
+The snippets read the connection settings from environment variables. See the
+[connection URL table](https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id) for the
+`ZEROBUS_SERVER_ENDPOINT` and `DATABRICKS_WORKSPACE_URL` formats on each cloud.
 
 **Synchronous:**
 
 ```python
+import os
+
 from zerobus.sdk.sync import ZerobusSdk
 from zerobus.sdk.shared import TableProperties
 
-server_endpoint = "https://1234567890123456.zerobus.us-west-2.cloud.databricks.com"
-workspace_url = "https://dbc-a1b2c3d4-e5f6.cloud.databricks.com"
+server_endpoint = os.environ["ZEROBUS_SERVER_ENDPOINT"]
+workspace_url = os.environ["DATABRICKS_WORKSPACE_URL"]
+client_id = os.environ["DATABRICKS_CLIENT_ID"]
+client_secret = os.environ["DATABRICKS_CLIENT_SECRET"]
 
 sdk = ZerobusSdk(server_endpoint, workspace_url)
-table_properties = TableProperties("main.default.air_quality")
+table_properties = TableProperties(os.environ["ZEROBUS_TABLE_NAME"])
 stream = sdk.create_stream(client_id, client_secret, table_properties)
 
 try:
@@ -145,15 +165,19 @@ finally:
 
 ```python
 import asyncio
+import os
+
 from zerobus.sdk.aio import ZerobusSdk
 from zerobus.sdk.shared import TableProperties
 
 async def main():
-    server_endpoint = "https://1234567890123456.zerobus.us-west-2.cloud.databricks.com"
-    workspace_url = "https://dbc-a1b2c3d4-e5f6.cloud.databricks.com"
+    server_endpoint = os.environ["ZEROBUS_SERVER_ENDPOINT"]
+    workspace_url = os.environ["DATABRICKS_WORKSPACE_URL"]
+    client_id = os.environ["DATABRICKS_CLIENT_ID"]
+    client_secret = os.environ["DATABRICKS_CLIENT_SECRET"]
 
     sdk = ZerobusSdk(server_endpoint, workspace_url)
-    table_properties = TableProperties("main.default.air_quality")
+    table_properties = TableProperties(os.environ["ZEROBUS_TABLE_NAME"])
     stream = await sdk.create_stream(client_id, client_secret, table_properties)
 
     try:
@@ -222,7 +246,7 @@ Alternatively, generate the schema automatically from an existing Unity Catalog 
 
 ```bash
 python -m zerobus.tools.generate_proto \
-    --uc-endpoint "https://dbc-a1b2c3d4-e5f6.cloud.databricks.com" \
+    --uc-endpoint "<your-databricks-workspace-url>" \
     --client-id "your-client-id" \
     --client-secret "your-client-secret" \
     --table "main.default.air_quality" \
@@ -287,6 +311,152 @@ asyncio.run(main())
 
 See the [`examples/`](examples/) directory for complete runnable examples.
 
+## Authentication
+
+`create_stream()` supports three authentication methods: `auth` (external-IdP
+federation), a custom `headers_provider`, and `client_id`/`client_secret` (OAuth).
+`auth` and `client_id`/`client_secret` are mutually exclusive — passing both
+raises `ValueError` rather than silently preferring one. When `auth` is given
+alongside `headers_provider`, `auth` takes precedence.
+
+### OAuth client credentials (default)
+
+```python
+stream = sdk.create_stream(
+    client_id="your-client-id",
+    client_secret="your-client-secret",
+    table_properties=table_properties,
+)
+```
+
+### External-IdP federation (e.g. Entra ID)
+
+Use `auth=FederatedToken(...)` to authenticate with an external identity
+provider instead of a Databricks OAuth secret. You provide a callback that
+returns the current external IdP token; the SDK exchanges it for a
+Zerobus-scoped Databricks token (RFC 8693 token exchange) and caches and
+refreshes that token for you. The callback may be synchronous (sync SDK) or
+asynchronous (async SDK).
+
+```python
+from zerobus import FederatedToken
+
+def get_idp_token():
+    # Return the current external IdP (e.g. Entra ID) access token.
+    ...
+
+# Account-level federation: no Databricks service principal. The identity is
+# synced into Databricks via Automatic Identity Management (SCIM). Build the
+# FederatedToken once and reuse it across create_stream calls: the exchanged
+# Databricks token is cached per token instance, so reusing one shares that cache
+# (a distinct instance is a distinct identity and re-mints its own token).
+auth = FederatedToken(idp_token_supplier=get_idp_token)
+stream = sdk.create_stream(table_properties=table_properties, auth=auth)
+another_stream = sdk.create_stream(table_properties=other_table, auth=auth)
+
+# Workload identity federation: a Databricks service principal with a client_id
+# and no secret, with a federation policy attached.
+workload_auth = FederatedToken(
+    idp_token_supplier=get_idp_token, databricks_client_id="<sp-client-id>"
+)
+stream = sdk.create_stream(table_properties=table_properties, auth=workload_auth)
+```
+
+The callback is invoked only when a fresh token must be minted (a cache miss or
+refresh), not on every request, so keep it reasonably fast — ideally returning a
+cached IdP token rather than doing a blocking network call on each invocation.
+
+> **Note:** A **synchronous** callback runs inline while it blocks, holding the
+> interpreter (GIL), so a slow blocking one stalls the SDK for the whole IdP
+> round-trip and cannot be interrupted by `recovery_timeout_ms`. This holds on the
+> **async** SDK too: a sync callback is invoked before the await point, so it
+> blocks the event loop / a worker just as it blocks the sync SDK. For IdP calls
+> that may do real network I/O, use the **async** SDK with an `async def` callback
+> (the SDK awaits it without holding the GIL), or keep a sync callback fast by
+> returning an already-cached token.
+
+See [`examples/sync_example_federated.py`](examples/sync_example_federated.py) for a complete example.
+
+### Custom headers provider
+
+For advanced cases you can supply your own `HeadersProvider` via
+`headers_provider=`; see the [`HeadersProvider`](#headersprovider) reference.
+
+## Persistent Streams
+
+A persistent (Eos) stream records its identity and committed offset on the server. After a
+restart, you resume the same stream by its `stream_id`, and delivery into Delta stays
+exactly-once.
+
+Persistent streams support JSON and protobuf records. They authenticate with OAuth or a
+custom headers provider. They do not support Avro or external-IdP federation.
+
+> **Experimental.** The persistent stream API in the Rust core is in development. It can
+> change in a minor release.
+
+```python
+import os
+
+from zerobus.sdk.sync import ZerobusSdk
+
+sdk = ZerobusSdk(host, unity_catalog_url)
+builder = sdk.persistent_stream_builder().table("catalog.schema.events").oauth(client_id, client_secret).json()
+
+# First run: create a stream. The server assigns the stream_id.
+# Later runs: resume the stream with the saved stream_id.
+saved_id = os.getenv("ZEROBUS_PERSISTENT_STREAM_ID")
+if saved_id:
+    stream = builder.resume(saved_id)  # use the same table and record format
+    print(stream.resume_watermark)  # offset the server had committed, or None if none
+else:
+    stream = builder.build()
+    print(f"Save this stream_id to resume later: {stream.stream_id}")
+
+for record in records:
+    stream.ingest_record_offset(record)
+stream.flush()
+stream.close()  # ends this connection only; the stream stays available to resume
+```
+
+Run the program once with no stream ID. Save the printed `stream_id`. After a restart, run it
+again with the saved ID. `resume_watermark` is `None` when the server has committed nothing
+yet. This is always the case for a new stream, and it can also be the case after `resume()`.
+
+In the async SDK, `build()` and `resume()` are coroutines, and the stream methods are awaited.
+
+### Recovering after a failure
+
+Save the `stream_id` as soon as `build()` returns, before you ingest any record. If the
+process stops before you save it, you cannot resume the stream.
+
+A persistent stream has no `get_unacked_records()` and no `recreate_stream()`. To recover,
+follow these steps:
+
+1. Call `resume(stream_id)` with the same table and record format.
+2. Read `resume_watermark`. This is the last offset the server committed, or `None` if it
+   committed nothing.
+3. Send again every record that your source holds after that offset. If `resume_watermark` is
+   `None`, send again every record.
+
+The SDK does not store your records. Your application must know which of its records
+match which offsets, for example by storing its own source position with each batch.
+
+Use one process per `stream_id`. The SDK does not check whether another client has
+resumed the same stream.
+
+The builder has these setters: `table`, `oauth`, `headers_provider`, `json`,
+`compiled_proto`, `recovery`, `recovery_timeout_ms`, `recovery_backoff_ms`,
+`recovery_retries`, `server_lack_of_ack_timeout_ms`, `flush_timeout_ms`,
+`max_inflight_requests`, `max_ingest_payload_bytes`, `ack_callback`, and
+`callback_max_wait_time_ms`. Unset values use the SDK defaults.
+
+`PersistentStream` has `ingest_record_offset()`, `ingest_records_offset()`,
+`wait_for_offset()`, `flush()`, and `close()`. It also has the properties `stream_id`,
+`resume_watermark`, and `is_closed`. Unlike `ZerobusStream`, it has no `ingest_record()`,
+no `*_nowait()` methods, and no `get_unacked_*()` methods.
+
+See `examples/sync_example_persistent.py` and `examples/async_example_persistent.py`. Both examples read the optional `ZEROBUS_PERSISTENT_STREAM_ID` environment variable.
+
 ## Configuration
 
 Configure stream behavior by passing a `StreamConfigurationOptions` object to `create_stream()`:
@@ -312,13 +482,14 @@ stream = sdk.create_stream(client_id, client_secret, table_properties, options)
 
 ### Available Options
 
-The record format is inferred from `TableProperties`: omitting `descriptor_proto` selects JSON,
-while providing a Protobuf descriptor selects Protobuf. `record_type` is retained for backward
-compatibility but does not select the format.
+The record format is inferred from `TableProperties`: a Protobuf descriptor selects Protobuf,
+an `avro_schema` selects Avro, and neither selects JSON. `record_type` defaults to
+`RecordType.UNSPECIFIED` (infer from `TableProperties`); a non-`UNSPECIFIED` value does not
+select the format but must match the inferred one, otherwise stream creation raises `ValueError`.
 
 | Option                           | Type            | Default            | Description                                                                                                          |
 | -------------------------------- | --------------- | ------------------ | -------------------------------------------------------------------------------------------------------------------- |
-| `record_type`                    | `RecordType`    | `RecordType.PROTO` | Retained for backward compatibility; format comes from `TableProperties.descriptor_proto`                            |
+| `record_type`                    | `RecordType`    | `RecordType.UNSPECIFIED` | Optional; when not `UNSPECIFIED` it must match the format inferred from `TableProperties`                       |
 | `max_inflight_records`           | `int`           | `1000000`          | Maximum number of unacknowledged records                                                                             |
 | `recovery`                       | `bool`          | `True`             | Enable automatic stream recovery                                                                                     |
 | `recovery_timeout_ms`            | `int`           | `15000`            | Timeout for recovery operations (ms)                                                                                 |
@@ -454,13 +625,25 @@ Main entry point. Sync: `from zerobus.sdk.sync import ZerobusSdk` / Async: `from
 
 ```python
 sdk = ZerobusSdk(
-    host="https://<workspace>.zerobus.<region>.cloud.databricks.com",
-    unity_catalog_url="https://<workspace-host>",
+    host=server_endpoint,
+    unity_catalog_url=workspace_url,
     application_name="my-app/1.0",
+    connection_per_stream=True,
 )
 ```
 
 `application_name` is optional; when set it is appended to the `user-agent` header on gRPC requests to the Zerobus server (not on the OAuth token requests to the login service). It follows the `"<product>/<version>"` convention (e.g. `my-app/1.0`).
+
+`connection_per_stream` gives every JSON/protobuf stream a dedicated gRPC
+connection by default. Set it to `False` to share one HTTP/2 connection across
+streams. Arrow Flight streams are unaffected.
+
+HTTP/2 multiplexes logical streams over one TCP connection. On high-throughput
+workloads over the public internet, packet loss and TCP retransmissions can
+cause head-of-line blocking across every stream on that connection, reducing
+aggregate throughput. Dedicated connections isolate that loss. For many
+smaller, low-throughput streams, set `connection_per_stream=False`; shared
+multiplexing is recommended there to reduce connection overhead.
 
 ```python
 # Sync
@@ -545,6 +728,9 @@ TableProperties("catalog.schema.table")
 
 # Protobuf mode
 TableProperties("catalog.schema.table", descriptor_proto=MyMessage.DESCRIPTOR)
+
+# Avro mode (beta) — mutually exclusive with descriptor_proto
+TableProperties("catalog.schema.table", avro_schema=json_schema)
 ```
 
 ### `StreamConfigurationOptions`
@@ -572,7 +758,7 @@ budget expires.
 
 ### `HeadersProvider`
 
-For custom authentication (e.g. custom token providers), implement `HeadersProvider` and pass it to `create_stream()`. Must include both `authorization` and `x-databricks-zerobus-table-name` headers. See [`examples/`](examples/) for implementation details.
+For custom authentication (e.g. custom token providers), implement `HeadersProvider` and pass it to `create_stream()`. Must include both `authorization` and `x-databricks-zerobus-table-name` headers. You may also override the optional `invalidate(self)` hook to drop cached auth state after the server rejects a token; the SDK calls it so a fresh token is fetched on the next `get_headers()`. See [`examples/`](examples/) for implementation details.
 
 ### `RecordAcknowledgment` (Sync only, deprecated)
 

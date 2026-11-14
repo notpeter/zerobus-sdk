@@ -4,8 +4,9 @@
 //! watch-for-failure → recover loop. The high-level pattern is reusable
 //! across transports, but the current implementation is wired to the gRPC
 //! transport (it calls into `create_stream_connection`, spawns the gRPC
-//! sender/receiver tasks, and uses `ZerobusClient<Channel>`). Future work
-//! to share this with Arrow Flight should abstract the transport seams.
+//! sender/receiver tasks, and gets its channels from a `GrpcChannelSource`).
+//! Future work to share this with Arrow Flight should abstract the transport
+//! seams.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -15,34 +16,54 @@ use tokio::time::Duration;
 use tokio_retry::strategy::FixedInterval;
 use tokio_retry::RetryIf;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Channel;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, instrument, warn};
 
+use super::transport::GrpcConnectionMode;
 use super::types::{CallbackMessage, OneshotMap, RecordLandingZone};
 use super::{ZerobusStream, STREAM_TEARDOWN_DRAIN_TIMEOUT_MS};
-use crate::databricks::zerobus::zerobus_client::ZerobusClient;
 use crate::errors::should_retry_initial_connection;
+use crate::grpc_channel::GrpcChannelSource;
+use crate::grpc_status::{GrpcCode, GrpcStatus};
 use crate::{
     EncodedBatch, HeadersProvider, OffsetId, StreamConfigurationOptions, TableProperties,
     ZerobusError, ZerobusResult,
 };
 
+/// What the supervisor reports back to the constructor once the stream is
+/// first opened: the server-assigned identity and, for a persistent resume, the
+/// committed-offset watermark the caller uses to reseed its offset generator.
+pub(super) struct StreamInitInfo {
+    pub(super) stream_id: String,
+    pub(super) last_committed_offset: Option<OffsetId>,
+}
+
 impl ZerobusStream {
     /// Supervisor task is responsible for managing the stream lifecycle.
     /// It handles stream creation, recovery, and error handling.
+    ///
+    /// `kind` selects the transport (ephemeral vs persistent). For a persistent
+    /// stream the supervisor opens with a create (or a resume, if the caller
+    /// supplied a stream id) on the first iteration, then resumes by the minted
+    /// id on every subsequent recovery — an ephemeral stream re-creates each
+    /// time, as before.
     #[allow(clippy::too_many_arguments)]
     #[instrument(level = "debug", skip_all, fields(table_name = %table_properties.table_name))]
     pub(super) async fn supervisor_task(
-        channel: ZerobusClient<Channel>,
+        channel_source: Arc<GrpcChannelSource>,
         table_properties: TableProperties,
         headers_provider: Arc<dyn HeadersProvider>,
         options: StreamConfigurationOptions,
+        // Mutated on the persistent recovery path to flip create → resume.
+        mut kind: GrpcConnectionMode,
         landing_zone: RecordLandingZone,
         oneshot_map: Arc<tokio::sync::Mutex<OneshotMap>>,
         logical_last_received_offset_id_tx: tokio::sync::watch::Sender<Option<OffsetId>>,
         is_closed: Arc<AtomicBool>,
+        sync_mutex: Arc<tokio::sync::Mutex<()>>,
+        terminal_token: CancellationToken,
         failed_records: Arc<RwLock<Vec<EncodedBatch>>>,
-        stream_init_result_tx: tokio::sync::oneshot::Sender<ZerobusResult<String>>,
+        stream_init_result_tx: tokio::sync::oneshot::Sender<ZerobusResult<StreamInitInfo>>,
         server_error_tx: tokio::sync::watch::Sender<Option<ZerobusError>>,
         cancellation_token: CancellationToken,
         callback_tx: Option<tokio::sync::mpsc::UnboundedSender<CallbackMessage>>,
@@ -84,43 +105,53 @@ impl ZerobusStream {
             // rejection, so the retry re-mints via the headers provider. Initial setup bounds
             // that invalidation under the setup deadline so a stalled provider cannot bypass
             // the one-shot limit; reconnect keeps its existing timeout-wrapped path unchanged.
+            // A persistent create has no client-supplied id yet, so if the server creates the
+            // stream but its response is lost, retrying can create an orphaned stream. Resumes
+            // are idempotent because they use the already-minted stream id.
             let is_initial = initial_stream_creation;
             let attempt = AtomicUsize::new(0);
             let create_attempt = || {
-                let channel = channel.clone();
+                let channel_source = Arc::clone(&channel_source);
                 let table_properties = table_properties.clone();
                 let headers_provider = Arc::clone(&headers_provider);
                 let record_type = options.record_type;
                 let attempt = &attempt;
+                let kind = &kind;
 
                 async move {
                     let attempt_no = attempt.fetch_add(1, Ordering::Relaxed) + 1;
-                    let result = if is_initial {
-                        Self::create_initial_stream_connection(
-                            channel,
-                            &table_properties,
-                            &headers_provider,
-                            record_type,
-                            options.recovery_timeout_ms,
-                        )
-                        .await
-                    } else {
-                        tokio::time::timeout(
+                    // Asking the source on every attempt retries a failed first
+                    // open, and lets recovery pick up rotated TLS certificates.
+                    let result = match channel_source.client().await {
+                        Err(e) => Err(e),
+                        Ok(channel) if is_initial => {
+                            Self::create_initial_stream_connection(
+                                channel,
+                                &table_properties,
+                                &headers_provider,
+                                record_type,
+                                kind,
+                                options.recovery_timeout_ms,
+                            )
+                            .await
+                        }
+                        Ok(channel) => tokio::time::timeout(
                             Duration::from_millis(options.recovery_timeout_ms),
                             Self::create_stream_connection(
                                 channel,
                                 &table_properties,
                                 &headers_provider,
                                 record_type,
+                                kind,
                             ),
                         )
                         .await
                         .map_err(|_| {
-                            ZerobusError::CreateStreamError(tonic::Status::deadline_exceeded(
+                            ZerobusError::CreateStreamError(GrpcStatus::deadline_exceeded(
                                 "Stream creation timed out",
                             ))
                         })
-                        .and_then(|res| res)
+                        .and_then(|res| res),
                     };
                     if let Err(ref e) = result {
                         warn!(
@@ -148,15 +179,14 @@ impl ZerobusStream {
             };
             let creation = RetryIf::spawn(strategy, create_attempt, should_retry).await;
 
-            let (tx, response_grpc_stream, stream_id) = match creation {
-                Ok((tx, response_grpc_stream, stream_id)) => (tx, response_grpc_stream, stream_id),
+            let connection = match creation {
+                Ok(connection) => connection,
                 Err(e) => {
                     if initial_stream_creation {
                         if let Some(tx) = stream_init_result_tx.take() {
                             let _ = tx.send(Err(e.clone()));
                         }
                     } else {
-                        is_closed.store(true, Ordering::Relaxed);
                         error!(
                             attempts = attempt.load(Ordering::Relaxed),
                             max_attempts = options.recovery_retries + 1,
@@ -164,7 +194,11 @@ impl ZerobusStream {
                             "Recovery failed; giving up stream re-creation: {}",
                             e
                         );
-                        Self::fail_all_pending_records(
+                        Self::fail_stream(
+                            sync_mutex.as_ref(),
+                            is_closed.as_ref(),
+                            &terminal_token,
+                            &server_error_tx,
                             landing_zone.clone(),
                             oneshot_map.clone(),
                             failed_records.clone(),
@@ -176,20 +210,57 @@ impl ZerobusStream {
                     return Err(e);
                 }
             };
+            let StreamInitInfo {
+                stream_id,
+                last_committed_offset,
+            } = connection.init_info;
             if initial_stream_creation {
                 if let Some(stream_init_result_tx_inner) = stream_init_result_tx.take() {
-                    let _ = stream_init_result_tx_inner.send(Ok(stream_id.clone()));
+                    let _ = stream_init_result_tx_inner.send(Ok(StreamInitInfo {
+                        stream_id: stream_id.clone(),
+                        last_committed_offset,
+                    }));
                 }
                 initial_stream_creation = false;
+                // A persistent stream recovers by resuming its now-known id, not
+                // by creating a fresh stream on every reconnect.
+                if let GrpcConnectionMode::Persistent { resume_stream_id } = &mut kind {
+                    *resume_stream_id = Some(stream_id.clone());
+                }
                 info!(stream_id = %stream_id, "Successfully created stream");
             } else {
                 info!(stream_id = %stream_id, "Successfully recovered stream");
                 let _ = server_error_tx.send(None);
             }
 
-            // 2. Reset landing zone.
+            // A dropped persistent connection can lose ACKs for records the
+            // server already committed. During automatic recovery only, resolve
+            // the committed observed prefix locally before resetting the
+            // remaining observed records for resend. A first-process resume has
+            // an empty landing zone and only seeds the receiver watermark.
+            // TODO: Validate the resumed watermark against retained ACK and sent-offset
+            // bounds before reconciling; treat None as -1 and fail closed if out of range.
+            let mut initial_last_acked_offset: OffsetId = -1;
+            if let Some(watermark) = last_committed_offset {
+                initial_last_acked_offset = watermark;
+                if !is_initial {
+                    Self::reconcile_committed_on_resume(
+                        &landing_zone_recovery,
+                        &oneshot_map,
+                        &logical_last_received_offset_id_tx,
+                        &callback_tx,
+                        watermark,
+                    )
+                    .await;
+                }
+            }
+
+            // Move only the still-unacknowledged observed records back for
+            // resend. Capture counts after reconciliation so the log describes
+            // what will actually be sent again.
             let resent_records = landing_zone_recovery.observed_count();
             let resent_batches = landing_zone_recovery.reset_observe();
+
             if resent_batches > 0 {
                 info!(
                     stream_id = %stream_id,
@@ -209,8 +280,8 @@ impl ZerobusStream {
             // Separate token for recv_task's close path
             let recv_drain_token = CancellationToken::new();
 
-            let mut recv_task = Self::spawn_receiver_task(
-                response_grpc_stream,
+            let mut recv_task = AbortOnDropHandle::new(Self::spawn_receiver_task(
+                connection.inbound,
                 logical_last_received_offset_id_tx.clone(),
                 landing_zone_receiver,
                 oneshot_map.clone(),
@@ -218,15 +289,17 @@ impl ZerobusStream {
                 options.clone(),
                 server_error_tx.clone(),
                 recv_drain_token.clone(),
+                per_stream_token.clone(),
                 callback_tx.clone(),
-            );
-            let mut send_task = Self::spawn_sender_task(
-                tx,
+                initial_last_acked_offset,
+            ));
+            let mut send_task = AbortOnDropHandle::new(Self::spawn_sender_task(
+                connection.sink,
                 landing_zone_sender,
                 Arc::clone(&is_paused),
                 server_error_tx.clone(),
                 per_stream_token.clone(),
-            );
+            ));
 
             // 4. Wait for any of the two tasks to end.
             let result = tokio::select! {
@@ -253,8 +326,12 @@ impl ZerobusStream {
                 }
                 send_result = &mut send_task => {
                     // Draining the recv_task prevents RST_STREAM(CANCEL) from being sent alongside END_STREAM.
-                    if matches!(send_result, Ok(Ok(()))) && cancellation_token.is_cancelled() {
-                        recv_drain_token.cancel();
+                    // The receiver also cancels `per_stream_token` to half-close. Let it apply the
+                    // final acks before it is aborted and `reset_observe` runs.
+                    if matches!(send_result, Ok(Ok(()))) {
+                        if cancellation_token.is_cancelled() {
+                            recv_drain_token.cancel();
+                        }
                         let _ = tokio::time::timeout(
                             Duration::from_millis(STREAM_TEARDOWN_DRAIN_TIMEOUT_MS),
                             &mut recv_task,
@@ -279,21 +356,18 @@ impl ZerobusStream {
                     // Mapping this to pass certain e2e tests.
                     // TODO: Remove this once we fix tests.
                     ZerobusError::StreamClosedError(status)
-                        if status.code() == tonic::Code::InvalidArgument =>
+                        if status.code() == GrpcCode::InvalidArgument =>
                     {
                         ZerobusError::InvalidArgument(status.message().to_string())
                     }
                     _ => error,
                 };
-                let _ = server_error_tx.send(Some(error.clone()));
                 if !error.is_retryable() || !options.recovery {
-                    is_closed.store(true, Ordering::Relaxed);
-                    // A mid-stream auth rejection means the cached token is no
-                    // longer accepted; drop it so the next stream re-mints.
-                    if error.is_auth_rejection() {
-                        headers_provider.invalidate().await;
-                    }
-                    Self::fail_all_pending_records(
+                    Self::fail_stream(
+                        sync_mutex.as_ref(),
+                        is_closed.as_ref(),
+                        &terminal_token,
+                        &server_error_tx,
                         landing_zone.clone(),
                         oneshot_map.clone(),
                         failed_records.clone(),
@@ -301,26 +375,112 @@ impl ZerobusStream {
                         &callback_tx,
                     )
                     .await;
+                    // A mid-stream auth rejection means the cached token is no
+                    // longer accepted; drop it so the next stream re-mints.
+                    // The terminal barrier and record preservation must finish
+                    // first because custom invalidation can block indefinitely.
+                    if error.is_auth_rejection() {
+                        headers_provider.invalidate().await;
+                    }
                     return Err(error);
                 }
+                let _ = server_error_tx.send(Some(error));
             }
         }
     }
 
-    /// Fails all pending records by removing them from the landing zone and sending error to all pending acks promises.
-    pub(super) async fn fail_all_pending_records(
+    /// Reconciles the retained landing-zone tail with the server's durable
+    /// position when resuming a persistent stream: removes the prefix of records
+    /// the server has already committed (SDK/wire offset <= `watermark`) and
+    /// resolves their pending acks locally, so they are never re-sent.
+    ///
+    /// This realignment makes resume survive a lost-ACK race: the records were
+    /// durably stored, but their acknowledgements were lost with the connection.
+    ///
+    /// The caller must have reset observation first, so every retained record
+    /// sits in the landing-zone queue in ascending offset order — the committed
+    /// ones therefore form a contiguous front prefix. Each removed offset is
+    /// acked to its waiter, reported to the ack callback, and advances the
+    /// last-received-offset watermark, matching what a real server ack would do.
+    async fn reconcile_committed_on_resume(
+        landing_zone: &RecordLandingZone,
+        oneshot_map: &Arc<tokio::sync::Mutex<OneshotMap>>,
+        logical_last_received_offset_id_tx: &tokio::sync::watch::Sender<Option<OffsetId>>,
+        callback_tx: &Option<tokio::sync::mpsc::UnboundedSender<CallbackMessage>>,
+        watermark: OffsetId,
+    ) {
+        let committed = landing_zone.remove_observed_prefix(|item| item.offset_id <= watermark);
+        if committed.is_empty() {
+            return;
+        }
+        let reconciled_records: usize =
+            committed.iter().map(|r| r.payload.get_record_count()).sum();
+        let mut map = oneshot_map.lock().await;
+        let mut highest = None;
+        for item in &committed {
+            if let Some(sender) = map.remove(&item.offset_id) {
+                let _ = sender.send(Ok(item.offset_id));
+            }
+            if let Some(tx) = callback_tx {
+                let _ = tx.send(CallbackMessage::Ack(item.offset_id));
+            }
+            highest = Some(item.offset_id);
+        }
+        drop(map);
+        if let Some(highest) = highest {
+            let _ = logical_last_received_offset_id_tx.send(Some(highest));
+        }
+        info!(
+            watermark,
+            reconciled_batches = committed.len(),
+            reconciled_records,
+            "Persistent resume: reconciled already-committed records at/below the watermark"
+        );
+    }
+
+    /// Atomically stops new ingests before draining every request admitted before failure.
+    ///
+    /// Every enqueue path re-checks `is_closed` while holding `sync_mutex`.
+    /// Taking the same mutex here makes the terminal transition a barrier: an
+    /// enqueue either finishes before `is_closed` is set and is included in the
+    /// subsequent drain, or observes the closed state and returns an error.
+    #[allow(clippy::too_many_arguments)]
+    async fn fail_stream(
+        sync_mutex: &tokio::sync::Mutex<()>,
+        is_closed: &AtomicBool,
+        terminal_token: &CancellationToken,
+        server_error_tx: &tokio::sync::watch::Sender<Option<ZerobusError>>,
         landing_zone: RecordLandingZone,
         oneshot_map: Arc<tokio::sync::Mutex<OneshotMap>>,
         failed_records: Arc<RwLock<Vec<EncodedBatch>>>,
         error: &ZerobusError,
         callback_tx: &Option<tokio::sync::mpsc::UnboundedSender<CallbackMessage>>,
     ) {
-        // Hold the `failed_records` lock across the landing-zone drain so this
-        // serializes with `get_unacked_batches` (which drains the zone under
-        // the same lock): whichever runs first gets the records, and the other
-        // sees them in `failed_records`. Extend rather than overwrite for the
-        // same reason.
+        // Acquire every async lock before publishing the terminal state. This
+        // prevents `get_unacked_batches` from observing `is_closed` and
+        // draining the landing zone before the supervisor owns the matching
+        // failed-record and oneshot state. Cancellation before this point
+        // leaves the landing zone untouched.
+        let _ingest_guard = sync_mutex.lock().await;
         let mut failed = failed_records.write().await;
+        let mut map = oneshot_map.lock().await;
+
+        is_closed.store(true, Ordering::Relaxed);
+        let _ = server_error_tx.send(Some(error.clone()));
+        terminal_token.cancel();
+        Self::drain_pending_records(landing_zone, &mut map, &mut failed, error, callback_tx);
+    }
+
+    /// Removes and preserves every pending record while failing its ack waiter.
+    /// The caller owns all async locks, so this function has no cancellation
+    /// point after `remove_all`.
+    fn drain_pending_records(
+        landing_zone: RecordLandingZone,
+        map: &mut OneshotMap,
+        failed: &mut Vec<EncodedBatch>,
+        error: &ZerobusError,
+        callback_tx: &Option<tokio::sync::mpsc::UnboundedSender<CallbackMessage>>,
+    ) {
         failed.reserve(landing_zone.len());
         let records = landing_zone.remove_all();
         if !records.is_empty() {
@@ -334,7 +494,6 @@ impl ZerobusStream {
                 error
             );
         }
-        let mut map = oneshot_map.lock().await;
         let error_message = error.to_string();
         for record in records {
             failed.push(record.payload);
@@ -348,5 +507,118 @@ impl ZerobusStream {
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    use super::super::types::IngestRequest;
+    use super::*;
+    use crate::landing_zone::LandingZone;
+
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_is_ordered_and_cancellation_safe() {
+        let sync_mutex = tokio::sync::Mutex::new(());
+        let is_closed = AtomicBool::new(false);
+        let terminal_token = CancellationToken::new();
+        let (server_error_tx, _) = tokio::sync::watch::channel(None);
+        let landing_zone = Arc::new(LandingZone::new(1));
+        let oneshot_map = Arc::new(tokio::sync::Mutex::new(OneshotMap::new()));
+        let failed_records = Arc::new(RwLock::new(Vec::new()));
+        let error = ZerobusError::InvalidStateError("terminal failure".to_string());
+        let callback_tx = None;
+
+        let reservation = landing_zone.reserve_capacity().await;
+        let batch = EncodedBatch::Proto(vec![b"admitted".to_vec()].into());
+
+        // Model an ingest that has entered its ordering section but has not
+        // enqueued yet. Polling the failure future explicitly proves that it
+        // parks on the same mutex, without sleeps or scheduler assumptions.
+        let ingest_guard = sync_mutex.lock().await;
+        let mut failure = Box::pin(ZerobusStream::fail_stream(
+            &sync_mutex,
+            &is_closed,
+            &terminal_token,
+            &server_error_tx,
+            Arc::clone(&landing_zone),
+            Arc::clone(&oneshot_map),
+            Arc::clone(&failed_records),
+            &error,
+            &callback_tx,
+        ));
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(failure.as_mut().poll(&mut context), Poll::Pending));
+        assert!(!is_closed.load(Ordering::Relaxed));
+
+        landing_zone.enqueue_reserved(
+            Box::new(IngestRequest {
+                payload: batch.clone(),
+                offset_id: 0,
+            }),
+            reservation,
+        );
+        drop(ingest_guard);
+        failure.await;
+
+        assert!(is_closed.load(Ordering::Relaxed));
+        assert!(terminal_token.is_cancelled());
+        assert_eq!(landing_zone.len(), 0);
+        assert_eq!(failed_records.read().await.as_slice(), &[batch]);
+
+        // Reuse the drained state to verify cancellation at the last async
+        // lock acquisition leaves the next record untouched.
+        failed_records.write().await.clear();
+        is_closed.store(false, Ordering::Relaxed);
+        let terminal_token = CancellationToken::new();
+        let (server_error_tx, _) = tokio::sync::watch::channel(None);
+        let batch = EncodedBatch::Proto(vec![b"recoverable".to_vec()].into());
+        let reservation = landing_zone.reserve_capacity().await;
+        landing_zone.enqueue_reserved(
+            Box::new(IngestRequest {
+                payload: batch.clone(),
+                offset_id: 0,
+            }),
+            reservation,
+        );
+
+        // Park the drain before it can remove records. Dropping the future at
+        // this cancellation point must leave the landing zone recoverable.
+        let map_guard = oneshot_map.lock().await;
+        let mut failure = Box::pin(ZerobusStream::fail_stream(
+            &sync_mutex,
+            &is_closed,
+            &terminal_token,
+            &server_error_tx,
+            Arc::clone(&landing_zone),
+            Arc::clone(&oneshot_map),
+            Arc::clone(&failed_records),
+            &error,
+            &callback_tx,
+        ));
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(failure.as_mut().poll(&mut context), Poll::Pending));
+        assert_eq!(landing_zone.len(), 1);
+        assert!(!is_closed.load(Ordering::Relaxed));
+        assert!(!terminal_token.is_cancelled());
+
+        drop(failure);
+        drop(map_guard);
+        assert!(failed_records.read().await.is_empty());
+        let records = landing_zone.remove_all();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].payload, batch);
     }
 }

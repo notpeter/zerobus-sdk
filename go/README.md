@@ -33,7 +33,7 @@ We are keen to hear feedback from you on this SDK. Please [file issues](https://
 - [Configuration Options](#configuration-options)
 - [Error Handling](#error-handling)
 - [Examples](#examples)
-- [Arrow Flight Ingestion (Beta)](#arrow-flight-ingestion-beta)
+- [Arrow Flight Ingestion](#arrow-flight-ingestion)
 - [Tests](#tests)
 - [Best Practices](#best-practices)
 - [Migration Guide](#migration-guide)
@@ -64,7 +64,8 @@ This SDK wraps the [Rust SDK](https://github.com/databricks/zerobus-sdk/tree/mai
 - **Configurable timeouts and retry policies**
 - **Immediate offset returns** for ingested records
 - **Graceful stream management** - Proper flushing and resource cleanup
-- **[Beta] Arrow Flight ingestion** - High-throughput Apache Arrow RecordBatch ingestion via the Arrow Flight protocol
+- **Arrow Flight ingestion** - High-throughput Apache Arrow RecordBatch ingestion via the Arrow Flight protocol
+
 ## Getting Started
 
 Choose your installation path:
@@ -97,13 +98,17 @@ go get github.com/databricks/zerobus-sdk/go@latest
 
 **In your code:**
 
+In these snippets, `serverEndpoint` is your Zerobus server endpoint and `workspaceURL` is your
+workspace URL. See the [connection URL table](https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id)
+for the format on each cloud.
+
 ```go
 import zerobus "github.com/databricks/zerobus-sdk/go"
 
 func main() {
     sdk, err := zerobus.NewZerobusSdk(
-        "https://your-shard.zerobus.region.cloud.databricks.com",
-        "https://your-workspace.cloud.databricks.com",
+        serverEndpoint,
+        workspaceURL,
     )
     if err != nil {
         log.Fatal(err)
@@ -136,7 +141,7 @@ See [Building from Source](#building-from-source) for more build options and [Co
 
 ## Quick Start
 
-The SDK supports two serialization formats and two ingestion methods:
+JSON and Protocol Buffers share one stream API, with two ingestion methods. Arrow Flight is a separate columnar API.
 
 **Serialization:**
 - **JSON** (Recommended for getting started): Simpler approach using JSON strings, no schema generation required
@@ -157,14 +162,15 @@ package main
 
 import (
     "log"
+    "os"
     zerobus "github.com/databricks/zerobus-sdk/go"
 )
 
 func main() {
     // 1. Initialize SDK
     sdk, err := zerobus.NewZerobusSdk(
-        "https://your-shard-id.zerobus.region.cloud.databricks.com",
-        "https://your-workspace.cloud.databricks.com",
+        os.Getenv("ZEROBUS_SERVER_ENDPOINT"),
+        os.Getenv("DATABRICKS_WORKSPACE_URL"),
     )
     if err != nil {
         log.Fatal(err)
@@ -352,7 +358,7 @@ The Go SDK consists of three layers:
 The SDK uses OAuth 2.0 client credentials flow:
 
 1. SDK constructs authorization request with Unity Catalog privileges
-2. Sends request to `{uc_endpoint}/oidc/v1/token` with client credentials
+2. Sends request to `{workspace_url}/oidc/v1/token` with client credentials
 3. Token includes scoped permissions for the specific table
 4. Token is attached to gRPC metadata as Bearer token
 5. Fresh tokens are fetched automatically on each connection
@@ -425,19 +431,13 @@ For JSON-based ingestion, you can skip the schema generation step and directly p
 
 ### 1. Initialize the SDK
 
-Create an SDK instance with your Databricks workspace endpoints:
+Create an SDK instance with your Zerobus server endpoint and workspace URL. See the
+[connection URL table](https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id) for the format on each cloud.
 
 ```go
-// For AWS
 sdk, err := zerobus.NewZerobusSdk(
-    "https://your-shard-id.zerobus.region.cloud.databricks.com",
-    "https://your-workspace.cloud.databricks.com",
-)
-
-// For Azure
-sdk, err := zerobus.NewZerobusSdk(
-    "https://your-shard-id.zerobus.region.azuredatabricks.net",
-    "https://your-workspace.azuredatabricks.net",
+    serverEndpoint,
+    workspaceURL,
 )
 
 if err != nil {
@@ -454,8 +454,8 @@ attribution, use `NewZerobusSdkWithOptions` and `WithApplicationName`:
 
 ```go
 sdk, err := zerobus.NewZerobusSdkWithOptions(
-    "https://your-shard-id.zerobus.region.cloud.databricks.com",
-    "https://your-workspace.cloud.databricks.com",
+    serverEndpoint,
+    workspaceURL,
     zerobus.WithApplicationName("my-app/1.0"),
 )
 ```
@@ -464,6 +464,18 @@ The wire value becomes `zerobus-sdk-go/<version> my-app/1.0`. By convention,
 application names use `<product>/<version>`. The existing
 `NewZerobusSdk(endpoint, unityCatalogURL)` constructor remains available when
 no options are needed.
+
+Every JSON/protobuf stream gets a dedicated gRPC connection by default. Pass
+`WithConnectionPerStream(false)` to multiplex streams over one shared HTTP/2
+connection. Arrow Flight streams already use dedicated connections and are
+unaffected.
+
+HTTP/2 multiplexes logical streams over one TCP connection. On high-throughput
+workloads over the public internet, packet loss and TCP retransmissions can
+cause head-of-line blocking across every stream on that connection, reducing
+aggregate throughput. Dedicated connections isolate that loss. For many
+smaller, low-throughput streams, shared multiplexing is recommended to reduce
+connection overhead.
 
 ### 2. Configure Authentication
 
@@ -802,7 +814,7 @@ The `examples/` directory contains complete, runnable examples organized by form
 - **`examples/proto/single/`** - Single record ingestion with protobuf
 - **`examples/proto/batch/`** - Batch ingestion with protobuf
 
-**Arrow Flight Examples (Beta):**
+**Arrow Flight Examples:**
 - **`examples/arrow/`** - Arrow RecordBatch ingestion via Arrow Flight protocol
 
 **To run an example:**
@@ -812,8 +824,8 @@ The `examples/` directory contains complete, runnable examples organized by form
 cd examples/json/single
 
 # Set your credentials
-export ZEROBUS_SERVER_ENDPOINT="https://your-zerobus-endpoint.databricks.com"
-export DATABRICKS_WORKSPACE_URL="https://your-workspace.databricks.com"
+export ZEROBUS_SERVER_ENDPOINT="<your-zerobus-server-endpoint>"
+export DATABRICKS_WORKSPACE_URL="<your-databricks-workspace-url>"
 export DATABRICKS_CLIENT_ID="your-client-id"
 export DATABRICKS_CLIENT_SECRET="your-client-secret"
 export ZEROBUS_TABLE_NAME="catalog.schema.table"
@@ -824,11 +836,9 @@ go run main.go
 
 Each example includes detailed comments and demonstrates best practices for production use. See [`examples/README.md`](examples/README.md) for complete setup instructions, prerequisites, and detailed comparisons between examples.
 
-## Arrow Flight Ingestion (Beta)
+## Arrow Flight Ingestion
 
-> **Beta**: Arrow Flight ingestion is in Beta. The API is stabilising but may still change before reaching GA.
-
-Ingest Apache Arrow RecordBatches directly into Databricks Delta tables using the Arrow Flight protocol. Use this if your pipeline already works with Arrow data. For JSON or Protocol Buffers, use the standard `ZerobusStream`.
+Ingest Apache Arrow RecordBatches directly into Databricks Delta tables using the Arrow Flight protocol. Use this if your pipeline already works with Arrow data. For JSON or Protocol Buffers, use `ZerobusStream`.
 
 See [`examples/arrow/`](examples/arrow/) for a complete working example.
 
@@ -912,11 +922,11 @@ if err := stream.Flush(); err != nil {
 | `ServerLackOfAckTimeoutMs` | `uint64` | 60,000 | Server ack timeout (ms) |
 | `FlushTimeoutMs` | `uint64` | 300,000 | Flush timeout (ms) |
 | `ConnectionTimeoutMs` | `uint64` | 30,000 | Connection timeout (ms) |
-| `IPCCompression` | `IPCCompressionType` | IPCCompressionNone | IPC compression codec |
+| `IPCCompression` | `IPCCompressionType` | IPCCompressionZstd | IPC compression codec |
 
 `RecoverySetting`: `RecoveryEnabled` (default), `RecoveryDisabled`
 
-`IPCCompressionType`: `IPCCompressionNone` (default), `IPCCompressionLZ4Frame`, `IPCCompressionZstd`
+`IPCCompressionType`: `IPCCompressionZstd` (default), `IPCCompressionLZ4Frame`, `IPCCompressionNone`. The zero value, `IPCCompressionDefault`, also means ZSTD; set `IPCCompressionNone` to send uncompressed payloads.
 
 ```go
 opts := zerobus.DefaultArrowStreamConfigurationOptions()
@@ -1049,16 +1059,21 @@ func NewZerobusSdkWithOptions(
 ) (*ZerobusSdk, error)
 
 func WithApplicationName(name string) SdkOption
+
+func WithConnectionPerStream(enabled bool) SdkOption
 ```
 
 Creates a new SDK instance.
 
 - `zerobusEndpoint` - Zerobus gRPC service endpoint
-- `unityCatalogURL` - Unity Catalog URL for OAuth token acquisition
+- `unityCatalogURL` - Your Databricks workspace URL, used for Unity Catalog and OAuth
 - `SdkOption` - An optional SDK-construction setting passed to
   `NewZerobusSdkWithOptions`
 - `WithApplicationName` - Appends a trimmed application identifier to the
   default wire user-agent, `zerobus-sdk-go/<version>`; blank names are ignored
+- `WithConnectionPerStream` - Controls whether each JSON/protobuf stream gets a
+  dedicated gRPC connection. The default is `true`; pass `false` to share one
+  HTTP/2 connection
 
 The original `NewZerobusSdk` constructor remains available. Use
 `NewZerobusSdkWithOptions` when the application should identify itself in
@@ -1066,8 +1081,8 @@ requests:
 
 ```go
 sdk, err := zerobus.NewZerobusSdkWithOptions(
-    zerobusEndpoint,
-    unityCatalogURL,
+    serverEndpoint,
+    workspaceURL,
     zerobus.WithApplicationName("my-app/1.0"),
 )
 ```
@@ -1414,7 +1429,7 @@ func (e *ZerobusError) Retryable() bool
 
 Returns `true` if the error can be automatically recovered by the SDK.
 
-### `ZerobusArrowStream` (Beta)
+### `ZerobusArrowStream`
 
 Represents an active Arrow Flight ingestion stream.
 
@@ -1450,7 +1465,7 @@ func (s *ZerobusArrowStream) GetUnackedBatches() ([][]byte, error)
 
 Returns unacknowledged batches as Arrow IPC bytes. Call on a failed stream before `Close()`.
 
-### `ArrowStreamConfigurationOptions` (Beta)
+### `ArrowStreamConfigurationOptions`
 
 Arrow stream configuration. See [ArrowStreamConfigurationOptions](#arrowstreamconfigurationoptions) for details.
 

@@ -2,27 +2,29 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use pyo3::{PyTraverseError, PyVisit};
 use tokio::runtime::Runtime;
 use tokio::sync::RwLock;
 
 use databricks_zerobus_ingest_sdk::{
-    StreamBuilder, ZerobusSdk as RustSdk, ZerobusStream as RustStream,
+    PersistentStream as RustPersistentStream, StreamBuilder, ZerobusSdk as RustSdk,
+    ZerobusStream as RustStream,
 };
 
 use crate::arrow;
 use crate::arrow::{ArrowStreamConfigurationOptions, ZerobusArrowStream};
-use crate::auth::HeadersProviderWrapper;
+use crate::auth::{HeadersProviderWrapper, IdpCallbackHolder, IdpSupplier};
 use crate::common::{
     apply_grpc_options, encoded_record_to_pybytes, extract_record_payload, extract_record_payloads,
-    map_error, StreamConfigurationOptions, TableProperties, SDK_IDENTIFIER_PREFIX,
+    map_error, RecordFormat, StreamConfigurationOptions, TableProperties, SDK_IDENTIFIER_PREFIX,
 };
+use crate::persistent::{PersistentConfig, PersistentStreamSettings};
 
 // =============================================================================
 // STREAM-BUILDER HELPERS
 // =============================================================================
 
-/// Apply table name + record-format selection (JSON or compiled-proto, based
-/// on whether `TableProperties` carried a descriptor) to the builder.
+/// Apply table name + record-format selection (proto/avro/json) to the builder.
 fn apply_table_and_format<'a>(
     builder: StreamBuilder<'a>,
     table_properties: &TableProperties,
@@ -30,7 +32,12 @@ fn apply_table_and_format<'a>(
     let builder = builder.table(table_properties.table_name.clone());
     match table_properties.descriptor_proto.clone() {
         Some(descriptor) => builder.compiled_proto(descriptor),
-        None => builder.json(),
+        None => {
+            if let Some(schema) = table_properties.avro_schema.clone() {
+                return builder.avro(schema);
+            }
+            builder.json()
+        }
     }
 }
 
@@ -44,10 +51,32 @@ pub struct RecordAcknowledgment {
     runtime: Arc<Runtime>,
     offset: i64,
     done: bool,
+    /// For a federated stream, a strong reference to the IdP callback holder,
+    /// carried from the originating `ZerobusStream`. The acknowledgment keeps the
+    /// native stream alive (via `stream` above) even after the caller releases the
+    /// Python stream, so it must also keep the callback reachable: `wait_for_ack`
+    /// can drive a recovery whose token mint needs a fresh IdP token. Exposed to
+    /// the cyclic GC via `__traverse__`/`__clear__` so an `owner -> acknowledgment
+    /// -> holder -> callback -> owner` cycle stays collectable. `None` for
+    /// OAuth / headers-provider streams.
+    idp_holder: Option<Py<IdpCallbackHolder>>,
 }
 
 #[pymethods]
 impl RecordAcknowledgment {
+    /// Let the cyclic GC see the strong reference to the IdP callback holder.
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        if let Some(holder) = &self.idp_holder {
+            visit.call(holder)?;
+        }
+        Ok(())
+    }
+
+    /// Drop the strong reference when the GC breaks a cycle.
+    fn __clear__(&mut self) {
+        self.idp_holder = None;
+    }
+
     /// Wait for the acknowledgment and return the offset ID.
     /// This method can only be called once.
     #[pyo3(signature = (_timeout_sec = None))]
@@ -86,11 +115,31 @@ impl RecordAcknowledgment {
 pub struct ZerobusStream {
     inner: Arc<RwLock<RustStream>>,
     runtime: Arc<Runtime>,
+    format: RecordFormat,
+    /// For a federated stream, a strong reference to the IdP callback holder (the
+    /// native supplier holds only a weak one). Exposed to the cyclic GC via
+    /// `__traverse__`/`__clear__` so an `owner -> stream -> holder -> callback ->
+    /// owner` cycle is collectable. `None` for OAuth / headers-provider streams.
+    idp_holder: Option<Py<IdpCallbackHolder>>,
 }
 
 #[pymethods]
 #[allow(deprecated)]
 impl ZerobusStream {
+    /// Let the cyclic GC see the strong reference to the IdP callback holder, so a
+    /// self-referential owner/stream/callback cycle can be collected.
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        if let Some(holder) = &self.idp_holder {
+            visit.call(holder)?;
+        }
+        Ok(())
+    }
+
+    /// Drop the strong reference when the GC breaks a cycle (the native supplier's
+    /// weak reference then resolves to `None`; the stream is being torn down).
+    fn __clear__(&mut self) {
+        self.idp_holder = None;
+    }
     /// Ingest a single record and return RecordAcknowledgment (legacy API)
     #[deprecated(
         since = "0.3.0",
@@ -101,7 +150,7 @@ impl ZerobusStream {
         py: Python,
         payload: &Bound<'_, PyAny>,
     ) -> PyResult<RecordAcknowledgment> {
-        let record_payload = extract_record_payload(payload)?;
+        let record_payload = extract_record_payload(payload, self.format)?;
         let stream = self.inner.clone();
         let runtime = self.runtime.clone();
 
@@ -121,12 +170,17 @@ impl ZerobusStream {
             runtime: self.runtime.clone(),
             offset,
             done: false,
+            // Carry the callback holder so the acknowledgment keeps the IdP callback
+            // reachable for as long as it owns the native stream: `wait_for_ack` may
+            // drive a recovery whose token mint needs a fresh IdP token, even after
+            // the caller has released the Python stream.
+            idp_holder: self.idp_holder.as_ref().map(|h| h.clone_ref(py)),
         })
     }
 
     /// Ingest a single record and return the offset directly (optimized API)
     fn ingest_record_offset(&self, py: Python, payload: &Bound<'_, PyAny>) -> PyResult<i64> {
-        let record_payload = extract_record_payload(payload)?;
+        let record_payload = extract_record_payload(payload, self.format)?;
         let stream = self.inner.clone();
         let runtime = self.runtime.clone();
 
@@ -143,7 +197,7 @@ impl ZerobusStream {
 
     /// Ingest a single record without waiting for acknowledgment (fire-and-forget)
     fn ingest_record_nowait(&self, payload: &Bound<'_, PyAny>) -> PyResult<()> {
-        let record_payload = extract_record_payload(payload)?;
+        let record_payload = extract_record_payload(payload, self.format)?;
         let stream = self.inner.clone();
 
         self.runtime.spawn(async move {
@@ -160,7 +214,7 @@ impl ZerobusStream {
         py: Python,
         payloads: &Bound<'_, PyAny>,
     ) -> PyResult<Option<i64>> {
-        let record_payloads = extract_record_payloads(payloads)?;
+        let record_payloads = extract_record_payloads(payloads, self.format)?;
         if record_payloads.is_empty() {
             return Ok(None);
         }
@@ -181,7 +235,7 @@ impl ZerobusStream {
 
     /// Ingest multiple records without waiting for acknowledgments (batch fire-and-forget)
     fn ingest_records_nowait(&self, payloads: &Bound<'_, PyAny>) -> PyResult<()> {
-        let record_payloads = extract_record_payloads(payloads)?;
+        let record_payloads = extract_record_payloads(payloads, self.format)?;
         let stream = self.inner.clone();
 
         self.runtime.spawn(async move {
@@ -246,7 +300,7 @@ impl ZerobusStream {
                 Python::attach(|py| {
                     let out: Vec<Py<PyAny>> = records
                         .map(|record| encoded_record_to_pybytes(py, record))
-                        .collect();
+                        .collect::<PyResult<_>>()?;
                     Ok(out)
                 })
             })
@@ -270,11 +324,132 @@ impl ZerobusStream {
                             batch
                                 .into_iter()
                                 .map(|r| encoded_record_to_pybytes(py, r))
-                                .collect()
+                                .collect::<PyResult<_>>()
                         })
-                        .collect();
+                        .collect::<PyResult<_>>()?;
                     Ok(out)
                 })
+            })
+        })
+    }
+}
+
+// =============================================================================
+// PERSISTENT STREAM
+// =============================================================================
+
+#[pyclass(name = "PersistentStream")]
+pub struct PersistentStream {
+    inner: Arc<RwLock<RustPersistentStream>>,
+    runtime: Arc<Runtime>,
+    format: RecordFormat,
+    /// Captured when the stream opens; neither value changes afterwards.
+    stream_id: Option<String>,
+    resume_watermark: Option<i64>,
+}
+
+#[pymethods]
+impl PersistentStream {
+    /// The durable stream identity. Persist it to resume the stream later.
+    #[getter]
+    fn stream_id(&self) -> Option<String> {
+        self.stream_id.clone()
+    }
+
+    /// The offset the server had committed when the stream opened, or `None` if nothing was
+    /// committed yet (always `None` for a new stream).
+    #[getter]
+    fn resume_watermark(&self) -> Option<i64> {
+        self.resume_watermark
+    }
+
+    /// Whether the stream is closed. A close that is in progress counts as closed.
+    #[getter]
+    fn is_closed(&self) -> bool {
+        match self.inner.try_read() {
+            Ok(guard) => guard.is_closed(),
+            Err(_) => true,
+        }
+    }
+
+    /// Ingest a single record and return its offset once queued
+    fn ingest_record_offset(&self, py: Python, payload: &Bound<'_, PyAny>) -> PyResult<i64> {
+        let record_payload = extract_record_payload(payload, self.format)?;
+        let stream = self.inner.clone();
+        let runtime = self.runtime.clone();
+
+        py.detach(|| {
+            runtime.block_on(async move {
+                let guard = stream.read().await;
+                guard
+                    .ingest_record_offset(record_payload)
+                    .await
+                    .map_err(map_error)
+            })
+        })
+    }
+
+    /// Ingest multiple records and return one offset for the whole batch.
+    /// Returns `None` for an empty batch.
+    fn ingest_records_offset(
+        &self,
+        py: Python,
+        payloads: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<i64>> {
+        let record_payloads = extract_record_payloads(payloads, self.format)?;
+        if record_payloads.is_empty() {
+            return Ok(None);
+        }
+
+        let stream = self.inner.clone();
+        let runtime = self.runtime.clone();
+
+        py.detach(|| {
+            runtime.block_on(async move {
+                let guard = stream.read().await;
+                guard
+                    .ingest_records_offset(record_payloads)
+                    .await
+                    .map_err(map_error)
+            })
+        })
+    }
+
+    /// Wait for a specific offset to be acknowledged
+    fn wait_for_offset(&self, py: Python, offset: i64) -> PyResult<()> {
+        let stream = self.inner.clone();
+        let runtime = self.runtime.clone();
+
+        py.detach(|| {
+            runtime.block_on(async move {
+                let guard = stream.read().await;
+                guard.wait_for_offset(offset).await.map_err(map_error)
+            })
+        })
+    }
+
+    /// Flush the stream, waiting for all pending records to be acknowledged
+    fn flush(&self, py: Python) -> PyResult<()> {
+        let stream = self.inner.clone();
+        let runtime = self.runtime.clone();
+
+        py.detach(|| {
+            runtime.block_on(async move {
+                let guard = stream.read().await;
+                guard.flush().await.map_err(map_error)
+            })
+        })
+    }
+
+    /// Close the stream gracefully
+    fn close(&self, py: Python) -> PyResult<()> {
+        let stream = self.inner.clone();
+        let runtime = self.runtime.clone();
+
+        py.detach(|| {
+            runtime.block_on(async move {
+                let mut guard = stream.write().await;
+                guard.close().await.map_err(map_error)
             })
         })
     }
@@ -293,11 +468,12 @@ pub struct ZerobusSdk {
 #[pymethods]
 impl ZerobusSdk {
     #[new]
-    #[pyo3(signature = (host, unity_catalog_url, application_name = None))]
+    #[pyo3(signature = (host, unity_catalog_url, application_name = None, connection_per_stream = true))]
     fn new(
         host: String,
         unity_catalog_url: String,
         application_name: Option<String>,
+        connection_per_stream: bool,
     ) -> PyResult<Self> {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -317,7 +493,8 @@ impl ZerobusSdk {
         let builder = RustSdk::builder()
             .endpoint(host)
             .unity_catalog_url(unity_catalog_url)
-            .sdk_identifier(sdk_identifier);
+            .sdk_identifier(sdk_identifier)
+            .connection_per_stream(connection_per_stream);
         let builder = match application_name {
             Some(application_name) => builder.application_name(application_name),
             None => builder,
@@ -339,6 +516,39 @@ impl ZerobusSdk {
         Ok(())
     }
 
+    /// Open a new persistent (Eos) stream, or resume one when `resume_stream_id` is set
+    #[pyo3(signature = (table_properties, settings, resume_stream_id = None))]
+    fn open_persistent_stream(
+        &self,
+        py: Python,
+        table_properties: &TableProperties,
+        settings: &PersistentStreamSettings,
+        resume_stream_id: Option<String>,
+    ) -> PyResult<PersistentStream> {
+        let config = PersistentConfig::resolve(py, settings, table_properties)?;
+        let format = config.format();
+        let sdk = self.inner.clone();
+        let runtime = self.runtime.clone();
+
+        let stream = py.detach(|| {
+            runtime.block_on(async move {
+                let sdk_guard = sdk.read().await;
+                config
+                    .open(&sdk_guard, resume_stream_id)
+                    .await
+                    .map_err(map_error)
+            })
+        })?;
+
+        Ok(PersistentStream {
+            stream_id: stream.stream_id().map(str::to_owned),
+            resume_watermark: stream.resume_watermark(),
+            inner: Arc::new(RwLock::new(stream)),
+            runtime: self.runtime.clone(),
+            format,
+        })
+    }
+
     /// Create a new stream with OAuth authentication
     #[pyo3(signature = (client_id, client_secret, table_properties, options = None))]
     fn create_stream(
@@ -351,6 +561,8 @@ impl ZerobusSdk {
     ) -> PyResult<ZerobusStream> {
         let opts = options.unwrap_or_default();
         opts.validate()?;
+
+        let format = table_properties.resolve_format(opts.record_type)?;
         let sdk = self.inner.clone();
         let runtime = self.runtime.clone();
         let runtime_for_stream = self.runtime.clone();
@@ -368,6 +580,8 @@ impl ZerobusSdk {
         Ok(ZerobusStream {
             inner: Arc::new(RwLock::new(stream)),
             runtime: runtime_for_stream,
+            format,
+            idp_holder: None,
         })
     }
 
@@ -382,6 +596,8 @@ impl ZerobusSdk {
     ) -> PyResult<ZerobusStream> {
         let opts = options.unwrap_or_default();
         opts.validate()?;
+
+        let format = table_properties.resolve_format(opts.record_type)?;
         let provider = Arc::new(HeadersProviderWrapper::new(headers_provider));
         let sdk = self.inner.clone();
         let runtime = self.runtime.clone();
@@ -400,13 +616,71 @@ impl ZerobusSdk {
         Ok(ZerobusStream {
             inner: Arc::new(RwLock::new(stream)),
             runtime: runtime_for_stream,
+            format,
+            idp_holder: None,
+        })
+    }
+
+    /// Create a new stream with external-IdP federation (RFC 8693 token
+    /// exchange). `idp_supplier` is a fresh handle built per `create_stream`; its
+    /// stable cache identity (not its `Arc`) partitions the account-level token
+    /// cache, so reusing one `FederatedToken` shares its cached Databricks token.
+    /// The stream takes the sole retained strong reference to the supplier's
+    /// GC-visible `IdpCallbackHolder` (the native supplier holds only a weak one),
+    /// so a self-referential owner/stream/callback cycle stays collectable.
+    /// `databricks_client_id` is `Some` for workload identity federation and `None`
+    /// for account-level.
+    #[pyo3(signature = (table_properties, idp_supplier, databricks_client_id = None, options = None))]
+    fn create_stream_federated(
+        &self,
+        py: Python,
+        table_properties: TableProperties,
+        idp_supplier: PyRef<'_, IdpSupplier>,
+        databricks_client_id: Option<String>,
+        options: Option<StreamConfigurationOptions>,
+    ) -> PyResult<ZerobusStream> {
+        let opts = options.unwrap_or_default();
+        opts.validate()?;
+        let format = table_properties.resolve_format(opts.record_type)?;
+        let supplier = idp_supplier.supplier.clone();
+        // Take the strong, GC-visible reference to the callback holder from the
+        // supplier handle and move it onto the stream; the native supplier keeps
+        // only its weak reference. `holder` is `Some` for any freshly built handle;
+        // it is `None` only after the cyclic GC has cleared this handle.
+        let idp_holder = idp_supplier
+            .holder
+            .as_ref()
+            .ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "federated IdP supplier handle has already been cleared",
+                )
+            })?
+            .clone_ref(py);
+        let sdk = self.inner.clone();
+        let runtime = self.runtime.clone();
+        let runtime_for_stream = self.runtime.clone();
+
+        let stream = py.detach(|| {
+            runtime.block_on(async move {
+                let sdk_guard = sdk.read().await;
+                let builder = sdk_guard.stream_builder();
+                let builder = builder.federated_auth(supplier, databricks_client_id);
+                let builder = apply_table_and_format(builder, &table_properties);
+                let builder = apply_grpc_options(builder, &opts)?;
+                builder.build().await.map_err(map_error)
+            })
+        })?;
+
+        Ok(ZerobusStream {
+            inner: Arc::new(RwLock::new(stream)),
+            runtime: runtime_for_stream,
+            format,
+            idp_holder: Some(idp_holder),
         })
     }
 
     /// Create a new Arrow Flight stream with OAuth authentication.
     ///
-    /// **Beta**: Arrow Flight ingestion is in Beta. The API is stabilising
-    /// but may still change before reaching GA.
     #[pyo3(signature = (table_name, schema_ipc_bytes, client_id, client_secret, options = None))]
     fn create_arrow_stream(
         &self,
@@ -477,6 +751,10 @@ impl ZerobusSdk {
         Ok(ZerobusStream {
             inner: Arc::new(RwLock::new(new_stream)),
             runtime: runtime_for_stream,
+            format: old_stream.format,
+            // Carry the strong holder reference across recovery, or the native
+            // supplier's weak reference would resolve to None on the new stream.
+            idp_holder: old_stream.idp_holder.as_ref().map(|h| h.clone_ref(py)),
         })
     }
 }

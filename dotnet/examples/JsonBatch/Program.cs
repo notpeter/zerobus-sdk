@@ -1,9 +1,9 @@
 using Databricks.Zerobus;
 
 // Get configuration from environment.
-var zerobusEndpoint = Environment.GetEnvironmentVariable("ZEROBUS_SERVER_ENDPOINT")
+var serverEndpoint = Environment.GetEnvironmentVariable("ZEROBUS_SERVER_ENDPOINT")
     ?? throw new InvalidOperationException("ZEROBUS_SERVER_ENDPOINT not set");
-var unityCatalogUrl = Environment.GetEnvironmentVariable("DATABRICKS_WORKSPACE_URL")
+var workspaceUrl = Environment.GetEnvironmentVariable("DATABRICKS_WORKSPACE_URL")
     ?? throw new InvalidOperationException("DATABRICKS_WORKSPACE_URL not set");
 var clientId = Environment.GetEnvironmentVariable("DATABRICKS_CLIENT_ID")
     ?? throw new InvalidOperationException("DATABRICKS_CLIENT_ID not set");
@@ -14,8 +14,8 @@ var tableName = Environment.GetEnvironmentVariable("ZEROBUS_TABLE_NAME")
 
 // Create SDK instance.
 using var sdk = ZerobusSdk.CreateBuilder()
-    .Endpoint(zerobusEndpoint)
-    .UnityCatalogUrl(unityCatalogUrl)
+    .Endpoint(serverEndpoint)
+    .UnityCatalogUrl(workspaceUrl)
     .Build();
 
 // Configure stream options (optional).
@@ -42,11 +42,9 @@ string[] batchRecords =
     """{"device_name": "sensor-005", "temp": 24, "humidity": 64}""",
 ];
 
-long batchOffset = stream.IngestRecords(batchRecords);
-Console.WriteLine($"Batch of {batchRecords.Length} records ingested, batch offset: {batchOffset}");
+stream.IngestRecords(batchRecords);
+Console.WriteLine($"Queued batch of {batchRecords.Length} records");
 
-// Wait for the batch offset to ensure the entire batch is acknowledged.
-stream.WaitForOffset(batchOffset);
-Console.WriteLine("Batch acknowledged!");
-
-Console.WriteLine("All operations completed successfully!");
+// Wait once for the entire batch to be acknowledged.
+stream.Flush();
+Console.WriteLine("Batch successfully acknowledged!");

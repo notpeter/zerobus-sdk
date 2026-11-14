@@ -5,32 +5,193 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 
-use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::encode::{DictionaryHandling, FlightDataEncoderBuilder};
 use arrow_flight::error::FlightError;
+use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::{FlightClient, FlightData, PutResult};
+use arrow_ipc::writer::IpcWriteOptions;
 use futures::{stream::poll_fn, Stream, StreamExt};
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::{timeout, timeout_at, Duration, Instant};
 use tokio_util::sync::CancellationToken;
+use tonic::codec::CompressionEncoding;
 use tonic::metadata::MetadataValue;
-use tonic::transport::Channel;
 use tracing::{error, info, warn};
 
-use super::batch::make_ipc_write_options;
+use std::sync::Mutex as StdMutex;
+
+use super::batch::stream_ipc_write_options;
+use super::compressed_sizes::{CompressedSizeChannel, CompressedSizes, SentFrame};
 use super::metadata::{FlightAckMetadata, FlightBatchMetadata};
+use super::stats_size::frame_stats;
 use super::{
-    configured_deadline, ArrowStreamConfigurationOptions, ArrowTableProperties,
-    FlightConnectionParameters, RecordBatch, ZerobusArrowStream,
+    configured_deadline, ArrowCompression, ArrowDictionaryHandling,
+    ArrowStreamConfigurationOptions, ArrowTableProperties, BatchItem, FlightConnectionParameters,
+    ZerobusArrowStream,
 };
 use crate::errors::ZerobusError;
-use crate::headers_provider::HeadersProvider;
+use crate::grpc_channel;
+use crate::grpc_status::GrpcStatus;
+use crate::headers_provider::{insert_header_metadata, HeadersProvider};
+use crate::offset_generator::OffsetId;
 use crate::proxy::{self, ConnectorFactory};
+use crate::stats::{BatchStats, StatsExporter, StreamStat};
 use crate::tls_config::TlsConfig;
 use crate::ZerobusResult;
+
+/// The batch currently being encoded: its offset and row count plus uncompressed
+/// buffer bytes and wire bytes accumulated across its FlightData frames.
+/// Held in a single slot (not a per-offset map)
+/// because the encoder drains one batch's frames before pulling the next.
+struct EncodeInProgress {
+    offset: OffsetId,
+    send_attempts: Arc<AtomicU32>,
+    /// Assigned only after this batch yields its first data frame.
+    attempt: Option<u32>,
+    records: u64,
+    /// Rows not yet yielded in record-batch frames; dictionary frames add no rows.
+    remaining_records: u64,
+    uncompressed: u64,
+    wire: u64,
+}
+
+impl EncodeInProgress {
+    fn new(offset: OffsetId, send_attempts: Arc<AtomicU32>, records: u64) -> Self {
+        Self {
+            offset,
+            send_attempts,
+            attempt: None,
+            records,
+            remaining_records: records,
+            uncompressed: 0,
+            wire: 0,
+        }
+    }
+}
+
+/// Locks the accumulator slot, recovering the guard if a previous holder panicked.
+/// Telemetry is best-effort, so a poisoned slot must never panic the request body.
+fn lock_slot(
+    pending: &StdMutex<Option<EncodeInProgress>>,
+) -> std::sync::MutexGuard<'_, Option<EncodeInProgress>> {
+    pending.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// With gRPC compression, batch stats wait for tonic to compress each message, so the
+/// request stream and the transport share a [`CompressedSizes`].
+fn compressed_sizes(parameters: &FlightConnectionParameters<'_>) -> Option<Arc<CompressedSizes>> {
+    match (&parameters.stats_exporter, parameters.options.compression) {
+        (Some(exporter), ArrowCompression::GrpcZstd) => {
+            Some(Arc::new(CompressedSizes::new(Arc::clone(exporter))))
+        }
+        _ => None,
+    }
+}
+
+/// Accounts for one data frame, emitting `BatchSent` and clearing the slot on the final frame.
+///
+/// With `compressed_sizes`, the frame is handed over instead, and `BatchSent` is emitted
+/// once the final frame's message has been compressed and measured.
+fn record_sent_frame(
+    exporter: &dyn StatsExporter,
+    pending: &StdMutex<Option<EncodeInProgress>>,
+    frame: &FlightData,
+    compressed_sizes: Option<&CompressedSizes>,
+) {
+    let wire = (frame.data_header.len() + frame.data_body.len() + frame.app_metadata.len()) as u64;
+    // IPC row counts identify the final split frame without decoding the body.
+    // Dictionary messages contribute bytes but do not advance the row count.
+    let parsed_stats = frame_stats(frame);
+    let (offset, attempt, stats) = {
+        let mut slot = lock_slot(pending);
+        let Some(batch) = slot.as_mut() else {
+            if let Some(sizes) = compressed_sizes {
+                sizes.push_frame(SentFrame::Untracked);
+            }
+            return;
+        };
+        let attempt = *batch
+            .attempt
+            .get_or_insert_with(|| batch.send_attempts.fetch_add(1, Ordering::Relaxed));
+        let Some((records, uncompressed)) = parsed_stats else {
+            let offset = batch.offset;
+            *slot = None;
+            drop(slot);
+            if let Some(sizes) = compressed_sizes {
+                sizes.push_frame(SentFrame::Untracked);
+            }
+            warn!(target: super::LOG_TARGET, offset, attempt,
+                "Failed to read Arrow IPC frame statistics; omitting BatchSent for this transmission"
+            );
+            return;
+        };
+        batch.wire += wire;
+        batch.uncompressed += uncompressed;
+        batch.remaining_records = batch.remaining_records.saturating_sub(records);
+        let offset = batch.offset;
+        if batch.remaining_records != 0 {
+            if let Some(sizes) = compressed_sizes {
+                sizes.push_frame(SentFrame::Batch {
+                    offset,
+                    attempt,
+                    completed: None,
+                });
+            }
+            return;
+        }
+        let stats = BatchStats {
+            records: batch.records,
+            approximate_wire_bytes: batch.wire,
+            uncompressed_bytes: batch.uncompressed,
+        };
+        *slot = None;
+        (offset, attempt, stats)
+    };
+    match compressed_sizes {
+        Some(sizes) => sizes.push_frame(SentFrame::Batch {
+            offset,
+            attempt,
+            completed: Some(stats),
+        }),
+        None => crate::stats::dispatch(
+            exporter,
+            StreamStat::BatchSent {
+                offset,
+                attempt,
+                stats,
+            },
+        ),
+    }
+}
+
+/// Whether `frame` carries an IPC dictionary batch rather than a record batch.
+fn is_dictionary_frame(frame: &FlightData) -> bool {
+    arrow_ipc::root_as_message(&frame.data_header)
+        .is_ok_and(|message| message.header_as_dictionary_batch().is_some())
+}
+
+/// Maps `handling` to the Flight encoder's dictionary handling and the IPC write options
+/// that it needs.
+fn flight_dictionary_handling(
+    handling: ArrowDictionaryHandling,
+    ipc_write_options: IpcWriteOptions,
+) -> (DictionaryHandling, IpcWriteOptions) {
+    match handling {
+        ArrowDictionaryHandling::Hydrate => (DictionaryHandling::Hydrate, ipc_write_options),
+        ArrowDictionaryHandling::Resend => (DictionaryHandling::Resend, ipc_write_options),
+        // arrow-flight's `DictionaryHandling` has no delta variant. Deltas are an arrow-ipc
+        // write option, which the encoder applies when it sends dictionaries (`Resend`).
+        ArrowDictionaryHandling::Delta => (
+            DictionaryHandling::Resend,
+            ipc_write_options
+                .with_dictionary_handling(arrow_ipc::writer::DictionaryHandling::Delta),
+        ),
+    }
+}
 
 pub(super) type FlightResponseStream =
     Pin<Box<dyn Stream<Item = Result<PutResult, FlightError>> + Send>>;
@@ -213,12 +374,12 @@ impl Drop for RequestBodyStreamState {
 /// State owned by a single active DoPut connection.
 pub(super) struct FlightConnection {
     response_stream: FlightResponseStream,
-    batch_tx: mpsc::Sender<Result<RecordBatch, FlightError>>,
+    batch_tx: mpsc::Sender<BatchItem>,
     request_body: RequestBodyControl,
 }
 
 impl FlightConnection {
-    pub(super) fn sender(&self) -> mpsc::Sender<Result<RecordBatch, FlightError>> {
+    pub(super) fn sender(&self) -> mpsc::Sender<BatchItem> {
         self.batch_tx.clone()
     }
 
@@ -226,7 +387,7 @@ impl FlightConnection {
         self,
     ) -> (
         FlightResponseStream,
-        mpsc::Sender<Result<RecordBatch, FlightError>>,
+        mpsc::Sender<BatchItem>,
         RequestBodyControl,
     ) {
         (self.response_stream, self.batch_tx, self.request_body)
@@ -254,6 +415,7 @@ impl ZerobusArrowStream {
         let attempt_deadline =
             configured_deadline(attempt_started, attempt_timeout, "recovery_timeout_ms")?;
         let result = timeout_at(attempt_deadline, async {
+            let compressed_sizes = compressed_sizes(parameters);
             let client = Self::create_flight_client(
                 parameters.endpoint,
                 parameters.tls_config,
@@ -262,6 +424,7 @@ impl ZerobusArrowStream {
                 parameters.options,
                 parameters.headers_provider,
                 parameters.sdk_identifier,
+                compressed_sizes.clone(),
             )
             .await?;
 
@@ -270,6 +433,8 @@ impl ZerobusArrowStream {
                 parameters.table_properties,
                 parameters.options,
                 parameters.request_bodies,
+                parameters.stats_exporter.clone(),
+                compressed_sizes,
                 #[cfg(feature = "test-hooks")]
                 Arc::clone(parameters.test_hooks),
             )
@@ -277,7 +442,7 @@ impl ZerobusArrowStream {
         })
         .await
         .map_err(|_| {
-            ZerobusError::CreateStreamError(tonic::Status::deadline_exceeded(
+            ZerobusError::CreateStreamError(GrpcStatus::deadline_exceeded(
                 "Stream creation timed out",
             ))
         })?;
@@ -304,6 +469,7 @@ impl ZerobusArrowStream {
     }
 
     /// Creates a Flight client connected to the endpoint.
+    #[allow(clippy::too_many_arguments)]
     async fn create_flight_client(
         endpoint: &str,
         tls_config: &Arc<dyn TlsConfig>,
@@ -312,17 +478,15 @@ impl ZerobusArrowStream {
         options: &ArrowStreamConfigurationOptions,
         headers_provider: &Arc<dyn HeadersProvider>,
         sdk_identifier: &str,
-    ) -> ZerobusResult<FlightClient> {
+        compressed_sizes: Option<Arc<CompressedSizes>>,
+    ) -> ZerobusResult<FlightClient<CompressedSizeChannel>> {
         let connection_timeout = Duration::from_millis(options.connection_timeout_ms);
 
-        let base_endpoint = Channel::from_shared(endpoint.to_string())
-            .map_err(|e| ZerobusError::ChannelCreationError(e.to_string()))?
-            .user_agent(sdk_identifier)
-            .map_err(|e| ZerobusError::ChannelCreationError(e.to_string()))?
+        let base_endpoint = grpc_channel::base_endpoint(endpoint, sdk_identifier)?
             .connect_timeout(connection_timeout)
             .timeout(connection_timeout);
 
-        let configured_endpoint = tls_config.configure_endpoint(base_endpoint)?;
+        let configured_endpoint = tls_config.tls_settings()?.resolve()?.apply(base_endpoint)?;
         let host = configured_endpoint.uri().host().unwrap_or_default();
         let channel = match proxy::resolve_connector(host, connector_factory)? {
             Some(proxy_connector) => {
@@ -331,7 +495,13 @@ impl ZerobusArrowStream {
             None => configured_endpoint.connect_lazy(),
         };
 
-        let mut client = FlightClient::new(channel);
+        let inner = FlightServiceClient::new(CompressedSizeChannel::new(channel, compressed_sizes));
+        let inner = if options.compression == ArrowCompression::GrpcZstd {
+            inner.send_compressed(CompressionEncoding::Zstd)
+        } else {
+            inner
+        };
+        let mut client = FlightClient::new_from_inner(inner);
 
         // Add headers from the provider first, filtering out reserved headers.
         // The table name header is authoritative and must not be overridden.
@@ -359,9 +529,7 @@ impl ZerobusArrowStream {
                     .insert(AUTHORIZATION_HEADER, auth_value);
                 continue;
             }
-            client.add_header(key, &value).map_err(|e| {
-                ZerobusError::InvalidArgument(format!("Failed to add header '{}': {}", key, e))
-            })?;
+            insert_header_metadata(client.metadata_mut(), key, &value)?;
         }
 
         // Add the required table name header (authoritative, added last to ensure it's set).
@@ -375,32 +543,74 @@ impl ZerobusArrowStream {
     }
 
     /// Builds a request body that can be stopped at a FlightData boundary and observed
-    /// reaching EOF without dropping the surrounding HTTP/2 stream.
+    /// reaching EOF without dropping the surrounding HTTP/2 stream. The stream is a
+    /// schema frame (index 0) followed by per-batch data frames. Record-batch frames are
+    /// tagged with their wire offset; dictionary frames are not, because the server
+    /// numbers only record batches. When an exporter is registered, per-batch stats
+    /// accumulate in a single slot and `BatchSent` is emitted with the batch's final
+    /// frame, because cancellation or drop may arrive before another poll.
     fn make_request_stream(
-        batch_rx: mpsc::Receiver<Result<RecordBatch, FlightError>>,
+        batch_rx: mpsc::Receiver<BatchItem>,
         table_properties: &ArrowTableProperties,
         options: &ArrowStreamConfigurationOptions,
+        stats_exporter: Option<Arc<dyn StatsExporter>>,
+        compressed_sizes: Option<Arc<CompressedSizes>>,
         #[cfg(feature = "test-hooks")] test_hooks: Arc<super::TestHooks>,
     ) -> ZerobusResult<(FlightRequestStream, RequestBodyControl)> {
-        let ipc_write_options = make_ipc_write_options(options.ipc_compression)?;
+        let (dictionary_handling, ipc_write_options) = flight_dictionary_handling(
+            options.dictionary_handling,
+            stream_ipc_write_options(options)?,
+        );
+        // Hydrated streams never emit dictionary frames, so skip parsing their headers.
+        let sends_dictionaries = dictionary_handling == DictionaryHandling::Resend;
         let schema = Arc::clone(&table_properties.schema);
-        let batch_stream = tokio_stream::wrappers::ReceiverStream::new(batch_rx);
+        let pending: Arc<StdMutex<Option<EncodeInProgress>>> = Arc::new(StdMutex::new(None));
+
+        let pending_in = stats_exporter.as_ref().map(|_| Arc::clone(&pending));
+        let batch_stream =
+            tokio_stream::wrappers::ReceiverStream::new(batch_rx).map(move |result| {
+                let outbound = result?;
+                if let (Some(pending), Some(send_attempts)) = (&pending_in, outbound.send_attempts)
+                {
+                    *lock_slot(pending) = Some(EncodeInProgress::new(
+                        outbound.offset,
+                        send_attempts,
+                        outbound.batch.num_rows() as u64,
+                    ));
+                }
+                Ok(outbound.batch)
+            });
         let offset_counter = Arc::new(AtomicI64::new(0));
         let offset_counter_clone = Arc::clone(&offset_counter);
+        let stats_out = stats_exporter;
+        let pending_out = Arc::clone(&pending);
         let encoded: FlightRequestStream = Box::pin(
             FlightDataEncoderBuilder::new()
                 .with_schema(schema)
                 .with_options(ipc_write_options)
+                .with_dictionary_handling(dictionary_handling)
                 .build(batch_stream)
                 .enumerate()
                 .map(move |(idx, result)| {
                     result.map(|mut flight_data| {
                         if idx > 0 {
-                            let offset = offset_counter_clone.fetch_add(1, Ordering::Relaxed);
-                            let metadata = FlightBatchMetadata::new(offset);
-                            if let Ok(bytes) = metadata.to_bytes() {
-                                flight_data.app_metadata = bytes.into();
+                            if !(sends_dictionaries && is_dictionary_frame(&flight_data)) {
+                                let offset = offset_counter_clone.fetch_add(1, Ordering::Relaxed);
+                                let metadata = FlightBatchMetadata::new(offset);
+                                if let Ok(bytes) = metadata.to_bytes() {
+                                    flight_data.app_metadata = bytes.into();
+                                }
                             }
+                            if let Some(exporter) = &stats_out {
+                                record_sent_frame(
+                                    exporter.as_ref(),
+                                    &pending_out,
+                                    &flight_data,
+                                    compressed_sizes.as_deref(),
+                                );
+                            }
+                        } else if let Some(sizes) = &compressed_sizes {
+                            sizes.push_frame(SentFrame::Untracked);
                         }
                         flight_data
                     })
@@ -459,20 +669,23 @@ impl ZerobusArrowStream {
     /// This allows setup errors to be detected during stream creation rather than
     /// later during batch ingestion.
     async fn start_stream_connection(
-        mut client: FlightClient,
+        mut client: FlightClient<CompressedSizeChannel>,
         table_properties: &ArrowTableProperties,
         options: &ArrowStreamConfigurationOptions,
         request_bodies: &RequestBodyRegistry,
+        stats_exporter: Option<Arc<dyn StatsExporter>>,
+        compressed_sizes: Option<Arc<CompressedSizes>>,
         #[cfg(feature = "test-hooks")] test_hooks: Arc<super::TestHooks>,
     ) -> ZerobusResult<FlightConnection> {
         // Create channel for sending RecordBatches.
-        let (batch_tx, batch_rx) =
-            mpsc::channel::<Result<RecordBatch, FlightError>>(options.max_inflight_batches);
+        let (batch_tx, batch_rx) = mpsc::channel::<BatchItem>(options.max_inflight_batches);
 
         let (flight_data_stream, request_body) = Self::make_request_stream(
             batch_rx,
             table_properties,
             options,
+            stats_exporter,
+            compressed_sizes,
             #[cfg(feature = "test-hooks")]
             test_hooks,
         )?;
@@ -484,9 +697,9 @@ impl ZerobusArrowStream {
         let mut response_stream = client
             .do_put(flight_data_stream)
             .await
-            // `.into()` preserves the inner gRPC code; `Status::from_error` would
-            // flatten it to `Unknown` and break auth/retry classification.
-            .map_err(|e| ZerobusError::CreateStreamError(e.into()))?;
+            // `from_flight_error` preserves the inner gRPC code; `Status::from_error`
+            // would flatten it to `Unknown` and break auth/retry classification.
+            .map_err(|e| ZerobusError::CreateStreamError(GrpcStatus::from_flight_error(e)))?;
 
         // Wait for server's "ready" signal to confirm setup succeeded.
         // The server sends ack_up_to_offset = -1 after successful auth, schema validation,
@@ -530,7 +743,7 @@ impl ZerobusArrowStream {
             Ok(None) => {
                 // Server closed the stream without sending anything.
                 error!(target: super::LOG_TARGET, "Server closed stream during setup without response");
-                return Err(ZerobusError::StreamClosedError(tonic::Status::internal(
+                return Err(ZerobusError::StreamClosedError(GrpcStatus::internal(
                     "Server closed stream during setup",
                 )));
             }
@@ -558,6 +771,7 @@ impl ZerobusArrowStream {
     pub(super) async fn reconnect_transport(
         parameters: &FlightConnectionParameters<'_>,
     ) -> ZerobusResult<FlightConnection> {
+        let compressed_sizes = compressed_sizes(parameters);
         let client = Self::create_flight_client(
             parameters.endpoint,
             parameters.tls_config,
@@ -566,16 +780,18 @@ impl ZerobusArrowStream {
             parameters.options,
             parameters.headers_provider,
             parameters.sdk_identifier,
+            compressed_sizes.clone(),
         )
         .await?;
 
-        let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, FlightError>>(
-            parameters.options.max_inflight_batches,
-        );
+        let (batch_tx, batch_rx) =
+            mpsc::channel::<BatchItem>(parameters.options.max_inflight_batches);
         let (flight_data_stream, request_body) = Self::make_request_stream(
             batch_rx,
             parameters.table_properties,
             parameters.options,
+            parameters.stats_exporter.clone(),
+            compressed_sizes,
             #[cfg(feature = "test-hooks")]
             Arc::clone(parameters.test_hooks),
         )?;
@@ -587,9 +803,9 @@ impl ZerobusArrowStream {
         let mut response_stream = flight_client
             .do_put(flight_data_stream)
             .await
-            // `.into()` preserves the inner gRPC code; `Status::from_error` would
-            // flatten it to `Unknown` and break auth/retry classification.
-            .map_err(|e| ZerobusError::CreateStreamError(e.into()))?;
+            // `from_flight_error` preserves the inner gRPC code; `Status::from_error`
+            // would flatten it to `Unknown` and break auth/retry classification.
+            .map_err(|e| ZerobusError::CreateStreamError(GrpcStatus::from_flight_error(e)))?;
 
         let setup_timeout = Duration::from_millis(parameters.options.connection_timeout_ms);
         match timeout(setup_timeout, response_stream.next()).await {
@@ -623,7 +839,7 @@ impl ZerobusArrowStream {
             }
             Ok(None) => {
                 error!(target: super::LOG_TARGET, "Server closed stream during reconnect without response");
-                return Err(ZerobusError::StreamClosedError(tonic::Status::internal(
+                return Err(ZerobusError::StreamClosedError(GrpcStatus::internal(
                     "Server closed stream during reconnect",
                 )));
             }
@@ -650,29 +866,26 @@ impl ZerobusArrowStream {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicU32;
     use std::sync::Arc;
 
-    use arrow_flight::error::FlightError;
     use async_trait::async_trait;
     use futures::StreamExt;
     use tokio::sync::mpsc;
     use tokio::time::{timeout, Duration};
 
-    use super::super::{ArrowSchema, RecordBatch};
+    use super::super::{ArrowSchema, OutboundBatch};
     use super::{
-        ArrowStreamConfigurationOptions, ArrowTableProperties, FlightClient, FlightConnection,
-        FlightResponseStream, HeadersProvider, RequestBodyControl, RequestBodyRegistry, TlsConfig,
-        ZerobusArrowStream, ZerobusResult,
+        ArrowStreamConfigurationOptions, ArrowTableProperties, BatchItem, FlightClient,
+        FlightConnection, FlightResponseStream, HeadersProvider, RequestBodyControl,
+        RequestBodyRegistry, StatsExporter, TlsConfig, ZerobusArrowStream, ZerobusResult,
     };
 
     struct PassthroughTlsConfig;
 
     impl TlsConfig for PassthroughTlsConfig {
-        fn configure_endpoint(
-            &self,
-            endpoint: tonic::transport::Endpoint,
-        ) -> ZerobusResult<tonic::transport::Endpoint> {
-            Ok(endpoint)
+        fn tls_settings(&self) -> ZerobusResult<crate::TlsSettings> {
+            Ok(crate::TlsSettings::new())
         }
     }
 
@@ -684,13 +897,14 @@ mod tests {
             Ok(HashMap::from([
                 ("authorization", "Bearer secret-token".to_string()),
                 ("x-custom-header", "custom-value".to_string()),
+                ("x-custom-bin", "AP8NCg==".to_string()),
             ]))
         }
     }
 
     #[tokio::test]
     async fn supervisor_handoff_does_not_retain_redundant_sender() {
-        let (batch_tx, mut batch_rx) = mpsc::channel::<Result<RecordBatch, FlightError>>(1);
+        let (batch_tx, mut batch_rx) = mpsc::channel::<BatchItem>(1);
         let response_stream: FlightResponseStream = Box::pin(futures::stream::pending());
         let connection = FlightConnection {
             response_stream,
@@ -719,6 +933,8 @@ mod tests {
             batch_rx,
             &table_properties,
             &ArrowStreamConfigurationOptions::default(),
+            None,
+            None,
             #[cfg(feature = "test-hooks")]
             Arc::new(super::super::TestHooks::default()),
         )
@@ -733,6 +949,648 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn make_request_stream_emits_batch_sent() {
+        use arrow_array::Int32Array;
+        use arrow_schema::{DataType, Field};
+
+        use crate::stats::{channel_exporter, StreamStat};
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let table_properties = ArrowTableProperties {
+            table_name: "catalog.schema.table".to_string(),
+            schema: Arc::clone(&schema),
+        };
+        let make_batch = |rows: i32| {
+            super::super::RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from((0..rows).collect::<Vec<_>>()))],
+            )
+            .unwrap()
+        };
+
+        let (exporter, mut rx) = channel_exporter(std::num::NonZeroUsize::new(8).unwrap());
+        let (batch_tx, batch_rx) = mpsc::channel::<BatchItem>(4);
+        let (mut request_body, _control) = ZerobusArrowStream::make_request_stream(
+            batch_rx,
+            &table_properties,
+            &ArrowStreamConfigurationOptions {
+                compression: super::super::ArrowCompression::Uncompressed,
+                ..ArrowStreamConfigurationOptions::default()
+            },
+            Some(exporter as Arc<dyn StatsExporter>),
+            None,
+            #[cfg(feature = "test-hooks")]
+            Arc::new(super::super::TestHooks::default()),
+        )
+        .unwrap();
+
+        // Two batches at non-contiguous offsets each emit one completed send event.
+        batch_tx
+            .send(Ok(OutboundBatch {
+                offset: 7,
+                send_attempts: Some(Arc::new(AtomicU32::new(0))),
+                batch: make_batch(100),
+            }))
+            .await
+            .unwrap();
+        batch_tx
+            .send(Ok(OutboundBatch {
+                offset: 9,
+                send_attempts: Some(Arc::new(AtomicU32::new(0))),
+                batch: make_batch(200),
+            }))
+            .await
+            .unwrap();
+        drop(batch_tx);
+        while request_body.next().await.is_some() {}
+
+        let mut sent = Vec::new();
+        while let Ok(stat) = rx.try_recv() {
+            if let StreamStat::BatchSent {
+                offset,
+                attempt: _,
+                stats,
+            } = stat
+            {
+                sent.push((offset, stats));
+            }
+        }
+        assert_eq!(sent.len(), 2, "one BatchSent per completed batch");
+        let (o0, s0) = &sent[0];
+        let (o1, s1) = &sent[1];
+        assert_eq!(*o0, 7);
+        assert_eq!(s0.records, 100);
+        assert_eq!(*o1, 9);
+        assert_eq!(s1.records, 200);
+        for (_, s) in &sent {
+            assert!(s.uncompressed_bytes > 0, "uncompressed payload recorded");
+            assert!(
+                s.approximate_wire_bytes >= s.uncompressed_bytes,
+                "no compression: FlightData payload (including IPC metadata and padding) >= buffer bytes: wire={} uncompressed={}",
+                s.approximate_wire_bytes,
+                s.uncompressed_bytes
+            );
+        }
+    }
+
+    /// Sends `first` and `second` as batches of one dictionary column at offsets 0 and 1, and
+    /// returns every frame of the request body.
+    async fn dictionary_request_frames(
+        dictionary_handling: super::ArrowDictionaryHandling,
+        first: &[&str],
+        second: &[&str],
+    ) -> Vec<super::FlightData> {
+        use arrow_array::types::Int32Type;
+        use arrow_array::DictionaryArray;
+        use arrow_schema::{DataType, Field};
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "category",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let table_properties = ArrowTableProperties {
+            table_name: "catalog.schema.table".to_string(),
+            schema: Arc::clone(&schema),
+        };
+        let make_batch = |values: &[&str]| {
+            let categories: DictionaryArray<Int32Type> = values.iter().copied().collect();
+            super::super::RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(categories)])
+                .unwrap()
+        };
+
+        let (batch_tx, batch_rx) = mpsc::channel::<BatchItem>(2);
+        let (request_body, _control) = ZerobusArrowStream::make_request_stream(
+            batch_rx,
+            &table_properties,
+            &ArrowStreamConfigurationOptions {
+                dictionary_handling,
+                ..ArrowStreamConfigurationOptions::default()
+            },
+            None,
+            None,
+            #[cfg(feature = "test-hooks")]
+            Arc::new(super::super::TestHooks::default()),
+        )
+        .unwrap();
+
+        batch_tx
+            .send(Ok(OutboundBatch {
+                offset: 0,
+                send_attempts: None,
+                batch: make_batch(first),
+            }))
+            .await
+            .unwrap();
+        batch_tx
+            .send(Ok(OutboundBatch {
+                offset: 1,
+                send_attempts: None,
+                batch: make_batch(second),
+            }))
+            .await
+            .unwrap();
+        drop(batch_tx);
+        request_body.map(|frame| frame.unwrap()).collect().await
+    }
+
+    #[tokio::test]
+    async fn make_request_stream_resend_numbers_only_record_batches() {
+        use super::{is_dictionary_frame, ArrowDictionaryHandling, FlightBatchMetadata};
+
+        // The second batch has a different dictionary, so the encoder sends it too.
+        let frames =
+            dictionary_request_frames(ArrowDictionaryHandling::Resend, &["a", "b", "a"], &["c"])
+                .await;
+
+        // For each frame after the schema: whether its IPC header is a dictionary batch, and its
+        // wire offset.
+        let kinds_and_offsets: Vec<_> = frames[1..]
+            .iter()
+            .map(|frame| {
+                (
+                    is_dictionary_frame(frame),
+                    FlightBatchMetadata::from_bytes(&frame.app_metadata)
+                        .ok()
+                        .map(|metadata| metadata.offset_id),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds_and_offsets,
+            [
+                (true, None),
+                (false, Some(0)),
+                (true, None),
+                (false, Some(1))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn make_request_stream_delta_sends_only_new_dictionary_values() {
+        use super::{ArrowDictionaryHandling, FlightBatchMetadata};
+
+        // The second batch's dictionary, [a, b, c], extends the first, [a, b].
+        let frames = dictionary_request_frames(
+            ArrowDictionaryHandling::Delta,
+            &["a", "b"],
+            &["a", "b", "c"],
+        )
+        .await;
+
+        // Frames: schema, dictionary, batch, dictionary delta, batch.
+        assert_eq!(frames.len(), 5);
+        let message = arrow_ipc::root_as_message(&frames[3].data_header).unwrap();
+        let delta = message.header_as_dictionary_batch().unwrap();
+        assert!(delta.isDelta());
+        assert_eq!(delta.data().unwrap().length(), 1);
+        assert!(frames[3].app_metadata.is_empty());
+        assert_eq!(
+            FlightBatchMetadata::from_bytes(&frames[4].app_metadata)
+                .unwrap()
+                .offset_id,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_frame_stats_discard_only_the_current_transmission() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+        use arrow_ipc::CompressionType;
+        use tracing_subscriber::prelude::*;
+
+        use super::{record_sent_frame, EncodeInProgress, StdMutex};
+        use crate::stats::{channel_exporter, BatchStats, StreamStat};
+
+        struct WarningCount(Arc<AtomicUsize>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarningCount {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().level() == &tracing::Level::WARN {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let batch = RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+        )])
+        .unwrap();
+        let mut encoder = super::FlightDataEncoderBuilder::new()
+            .with_schema(batch.schema())
+            .with_options(
+                super::super::batch::make_ipc_write_options(Some(CompressionType::ZSTD)).unwrap(),
+            )
+            .build(futures::stream::iter([Ok(batch)]));
+        encoder.next().await.unwrap().unwrap(); // Schema.
+        let frame = encoder.next().await.unwrap().unwrap();
+        let expected_stats = BatchStats::new(
+            2,
+            (frame.data_header.len() + frame.data_body.len() + frame.app_metadata.len()) as u64,
+            1 + 2 * 4, // Validity bitmap and two int32 values.
+        );
+
+        let mut bad_header = frame.clone();
+        bad_header.data_header = bytes::Bytes::new();
+        let mut bad_body = frame.clone();
+        bad_body.data_body = bytes::Bytes::new(); // Missing compression length prefixes.
+
+        for invalid_frame in [bad_header, bad_body] {
+            assert!(super::frame_stats(&invalid_frame).is_none());
+            for invalid_first in [true, false] {
+                let warning_count = Arc::new(AtomicUsize::new(0));
+                let subscriber =
+                    tracing_subscriber::registry().with(WarningCount(warning_count.clone()));
+                tracing::subscriber::with_default(subscriber, || {
+                    let attempts = Arc::new(AtomicU32::new(0));
+                    let pending =
+                        StdMutex::new(Some(EncodeInProgress::new(7, attempts.clone(), 4)));
+                    let (exporter, mut rx) =
+                        channel_exporter(std::num::NonZeroUsize::new(8).unwrap());
+
+                    if !invalid_first {
+                        record_sent_frame(exporter.as_ref(), &pending, &frame, None);
+                        assert!(rx.try_recv().is_err(), "batch is still incomplete");
+                    }
+                    record_sent_frame(exporter.as_ref(), &pending, &invalid_frame, None);
+                    assert!(pending.lock().unwrap().is_none(), "discard invalid sample");
+                    // Remaining frames cannot revive the sample or advance its attempt.
+                    record_sent_frame(exporter.as_ref(), &pending, &frame, None);
+                    record_sent_frame(exporter.as_ref(), &pending, &invalid_frame, None);
+                    assert!(rx.try_recv().is_err(), "no incomplete or invalid stats");
+                    assert_eq!(attempts.load(Ordering::Relaxed), 1);
+
+                    // A new batch starts at attempt 0; retrying the failed sample uses 1.
+                    for (offset, counter, expected_attempt) in
+                        [(8, Arc::new(AtomicU32::new(0)), 0), (7, attempts, 1)]
+                    {
+                        *pending.lock().unwrap() = Some(EncodeInProgress::new(offset, counter, 2));
+                        record_sent_frame(exporter.as_ref(), &pending, &frame, None);
+                        match rx.try_recv().expect("valid transmission is reported") {
+                            StreamStat::BatchSent {
+                                offset: actual_offset,
+                                attempt,
+                                stats,
+                            } => {
+                                assert_eq!(actual_offset, offset);
+                                assert_eq!(attempt, expected_attempt);
+                                assert_eq!(stats, expected_stats);
+                            }
+                            other => panic!("expected BatchSent, got {other:?}"),
+                        }
+                    }
+                    assert!(rx.try_recv().is_err(), "no duplicate events");
+                });
+                assert_eq!(warning_count.load(Ordering::Relaxed), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_sent_attempts_count_transmissions_not_replay_preparation() {
+        use arrow_array::Int32Array;
+        use arrow_schema::{DataType, Field};
+        use tokio::sync::Semaphore;
+
+        use super::super::batch::{rebuild_pending_for_replay, PendingBatch};
+        use crate::stats::{channel_exporter, StreamStat};
+
+        async fn send_rebuilt(
+            pending: &mut Vec<PendingBatch>,
+            table_properties: &ArrowTableProperties,
+            exporter: Arc<dyn StatsExporter>,
+            acked_records: u64,
+            cancel_before_batch: bool,
+        ) -> usize {
+            let (replay, _) = rebuild_pending_for_replay(pending, acked_records);
+            let (batch_tx, batch_rx) = mpsc::channel::<BatchItem>(1);
+            let (mut body, control) = ZerobusArrowStream::make_request_stream(
+                batch_rx,
+                table_properties,
+                &ArrowStreamConfigurationOptions::default(),
+                Some(exporter),
+                None,
+                #[cfg(feature = "test-hooks")]
+                Arc::new(super::super::TestHooks::default()),
+            )
+            .unwrap();
+            for batch in replay {
+                batch_tx.send(Ok(batch)).await.unwrap();
+            }
+            // The schema is sent before the encoder pulls a queued batch.
+            body.next().await.unwrap().unwrap();
+            if cancel_before_batch {
+                control.shutdown();
+            }
+            drop(batch_tx);
+            let mut data_frames = 0;
+            while let Some(frame) = body.next().await {
+                frame.unwrap();
+                data_frames += 1;
+            }
+            data_frames
+        }
+
+        // Large enough to split into multiple FlightData frames. A transmission
+        // must advance the counter once, regardless of how many frames it uses.
+        const ROWS: usize = 1_100_000;
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let table_properties = ArrowTableProperties {
+            table_name: "catalog.schema.table".to_string(),
+            schema: Arc::clone(&schema),
+        };
+        let batch = super::super::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(
+                (0..ROWS as i32).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        let mut pending = vec![PendingBatch::new(
+            batch,
+            7,
+            0,
+            ROWS as u64,
+            Some(Arc::new(AtomicU32::new(0))),
+            Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+        )];
+        let (exporter, mut stats_rx) = channel_exporter(std::num::NonZeroUsize::new(8).unwrap());
+
+        // Failed reconnects may prepare and enqueue this batch repeatedly without
+        // ever transmitting it. None of those attempts consumes an ordinal.
+        for _ in 0..2 {
+            assert_eq!(
+                send_rebuilt(&mut pending, &table_properties, exporter.clone(), 0, true).await,
+                0
+            );
+        }
+        assert!(stats_rx.try_recv().is_err());
+        assert!(
+            send_rebuilt(&mut pending, &table_properties, exporter.clone(), 0, false).await > 1
+        );
+        match stats_rx.try_recv().expect("first transmission") {
+            StreamStat::BatchSent {
+                offset,
+                attempt,
+                stats,
+            } => {
+                assert_eq!(offset, 7);
+                assert_eq!(attempt, 0);
+                assert_eq!(stats.records, ROWS as u64);
+            }
+            other => panic!("expected BatchSent, got {other:?}"),
+        }
+
+        // A canceled replay after a real send must not skip an ordinal either.
+        assert_eq!(
+            send_rebuilt(&mut pending, &table_properties, exporter.clone(), 0, true).await,
+            0
+        );
+        assert!(stats_rx.try_recv().is_err());
+        assert!(send_rebuilt(&mut pending, &table_properties, exporter, 1, false).await > 1);
+        match stats_rx.try_recv().expect("suffix transmission") {
+            StreamStat::BatchSent {
+                offset,
+                attempt,
+                stats,
+            } => {
+                assert_eq!(offset, 7);
+                assert_eq!(attempt, 1);
+                assert_eq!(stats.records, (ROWS - 1) as u64);
+            }
+            other => panic!("expected BatchSent, got {other:?}"),
+        }
+        assert!(stats_rx.try_recv().is_err(), "one event per transmission");
+    }
+
+    /// A completed batch must retain its send event even if cancellation arrives
+    /// before the next encoder poll, with no successor batch or natural EOF.
+    #[cfg(feature = "arrow-flight")]
+    #[tokio::test]
+    async fn make_request_stream_preserves_completed_batch_on_cancel() {
+        use arrow_array::Int32Array;
+        use arrow_schema::{DataType, Field};
+
+        use crate::offset_generator::OffsetId;
+        use crate::stats::{channel_exporter, StreamStat};
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let table_properties = ArrowTableProperties {
+            table_name: "catalog.schema.table".to_string(),
+            schema: Arc::clone(&schema),
+        };
+        let batch = super::super::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from((0..50).collect::<Vec<_>>()))],
+        )
+        .unwrap();
+
+        // Drive one batch fully through the encoder (schema + data frames) while
+        // keeping batch_tx open (no EOF). `poll_to_idle` then polls once more so the
+        // encoder returns `Poll::Pending`; otherwise it cancels before that idle poll.
+        async fn drive(
+            table_properties: &ArrowTableProperties,
+            batch: super::super::RecordBatch,
+            poll_to_idle: bool,
+        ) -> Vec<OffsetId> {
+            let (exporter, mut rx) = channel_exporter(std::num::NonZeroUsize::new(8).unwrap());
+            let (batch_tx, batch_rx) = mpsc::channel::<BatchItem>(4);
+            let (mut request_body, control) = ZerobusArrowStream::make_request_stream(
+                batch_rx,
+                table_properties,
+                &ArrowStreamConfigurationOptions::default(),
+                Some(exporter as Arc<dyn StatsExporter>),
+                None,
+                #[cfg(feature = "test-hooks")]
+                Arc::new(super::super::TestHooks::default()),
+            )
+            .unwrap();
+            batch_tx
+                .send(Ok(OutboundBatch {
+                    offset: 7,
+                    send_attempts: Some(Arc::new(AtomicU32::new(0))),
+                    batch,
+                }))
+                .await
+                .unwrap();
+            // Pull the batch's frames (schema + record batch) so it is fully sent, but
+            // do NOT drop batch_tx — no natural EOF.
+            request_body.next().await;
+            request_body.next().await;
+            if poll_to_idle {
+                // No more input ready: an idle poll must not emit a duplicate event.
+                let _ = timeout(Duration::from_millis(200), request_body.next()).await;
+            } else {
+                // Cancel before an idle poll: the completed batch must still be reported.
+                control.shutdown();
+                drop(batch_tx);
+                while request_body.next().await.is_some() {}
+            }
+            let mut sent = Vec::new();
+            while let Ok(StreamStat::BatchSent { offset, .. }) = rx.try_recv() {
+                sent.push(offset);
+            }
+            sent
+        }
+
+        assert_eq!(
+            drive(&table_properties, batch.clone(), true).await,
+            vec![7],
+            "idle encoder retains exactly one event for the completed batch"
+        );
+        assert_eq!(
+            drive(&table_properties, batch, false).await,
+            vec![7],
+            "cancel before idle must preserve the completed batch's send event"
+        );
+    }
+
+    #[tokio::test]
+    async fn make_request_stream_reports_split_batch_only_after_final_frame() {
+        use arrow_array::Int32Array;
+        use arrow_flight::encode::FlightDataEncoderBuilder;
+        use arrow_schema::{DataType, Field};
+
+        use super::super::ArrowCompression;
+        use crate::stats::{channel_exporter, StreamStat};
+
+        const ROWS: usize = 1_100_000;
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let table_properties = ArrowTableProperties {
+            table_name: "catalog.schema.table".to_string(),
+            schema: Arc::clone(&schema),
+        };
+        let batch = super::super::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(
+                (0..ROWS as i32).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+
+        for compression in [
+            ArrowCompression::Uncompressed,
+            ArrowCompression::IpcLz4,
+            ArrowCompression::IpcZstd,
+        ] {
+            let options = ArrowStreamConfigurationOptions {
+                compression,
+                ..ArrowStreamConfigurationOptions::default()
+            };
+            // Establish the number of frames independently of telemetry. The real
+            // request body below stops without polling past that final frame.
+            let frame_count = FlightDataEncoderBuilder::new()
+                .with_schema(schema.clone())
+                .with_options(super::super::batch::stream_ipc_write_options(&options).unwrap())
+                .build(futures::stream::iter([Ok(batch.clone())]))
+                .map(|frame| frame.unwrap())
+                .count()
+                .await;
+            assert!(frame_count > 2, "schema plus multiple data frames");
+
+            for complete in [false, true] {
+                let (exporter, mut stats_rx) =
+                    channel_exporter(std::num::NonZeroUsize::new(8).unwrap());
+                let (batch_tx, batch_rx) = mpsc::channel::<BatchItem>(1);
+                let (mut body, control) = ZerobusArrowStream::make_request_stream(
+                    batch_rx,
+                    &table_properties,
+                    &options,
+                    Some(exporter),
+                    None,
+                    #[cfg(feature = "test-hooks")]
+                    Arc::new(super::super::TestHooks::default()),
+                )
+                .unwrap();
+                batch_tx
+                    .send(Ok(OutboundBatch {
+                        offset: 7,
+                        send_attempts: Some(Arc::new(AtomicU32::new(0))),
+                        batch: batch.clone(),
+                    }))
+                    .await
+                    .unwrap();
+
+                let frames_to_pull = if complete { frame_count } else { 2 };
+                let mut wire_bytes = 0;
+                let mut uncompressed_bytes = 0;
+                for index in 0..frames_to_pull {
+                    let frame = body.next().await.unwrap().unwrap();
+                    if index > 0 {
+                        wire_bytes += (frame.data_header.len()
+                            + frame.data_body.len()
+                            + frame.app_metadata.len())
+                            as u64;
+                        let message = arrow_ipc::root_as_message(&frame.data_header).unwrap();
+                        let rows = message.header_as_record_batch().unwrap().length() as u64;
+                        // IPC emits a validity bitmap and one int32 per row.
+                        #[allow(clippy::manual_div_ceil)]
+                        let validity_bytes = (rows + 7) / 8;
+                        uncompressed_bytes += rows * 4 + validity_bytes;
+                    }
+                    if index + 1 < frame_count {
+                        assert!(
+                            stats_rx.try_recv().is_err(),
+                            "no event before the final frame"
+                        );
+                    }
+                }
+
+                if complete {
+                    // No idle poll, EOF, or cancellation poll is needed to report the
+                    // completed batch. Dropping the body must not lose or duplicate it.
+                    drop(body);
+                    match stats_rx.try_recv().expect("completed batch send event") {
+                        StreamStat::BatchSent {
+                            offset,
+                            attempt,
+                            stats,
+                        } => {
+                            assert_eq!(offset, 7);
+                            assert_eq!(attempt, 0);
+                            assert_eq!(stats.records, ROWS as u64);
+                            assert_eq!(stats.approximate_wire_bytes, wire_bytes);
+                            assert_eq!(stats.uncompressed_bytes, uncompressed_bytes);
+                        }
+                        other => panic!("expected BatchSent, got {other:?}"),
+                    }
+                } else {
+                    control.shutdown();
+                    assert!(body.next().await.is_none());
+                }
+                assert!(
+                    stats_rx.try_recv().is_err(),
+                    "no partial or duplicate send events"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn request_body_remains_finished_after_natural_eof() {
         let table_properties = ArrowTableProperties {
             table_name: "catalog.schema.table".to_string(),
@@ -743,6 +1601,8 @@ mod tests {
             batch_rx,
             &table_properties,
             &ArrowStreamConfigurationOptions::default(),
+            None,
+            None,
             #[cfg(feature = "test-hooks")]
             Arc::new(super::super::TestHooks::default()),
         )
@@ -767,6 +1627,8 @@ mod tests {
             batch_rx,
             &table_properties,
             &ArrowStreamConfigurationOptions::default(),
+            None,
+            None,
             Arc::clone(&test_hooks),
         )
         .unwrap();
@@ -813,6 +1675,8 @@ mod tests {
             batch_rx,
             &table_properties,
             &ArrowStreamConfigurationOptions::default(),
+            None,
+            None,
             #[cfg(feature = "test-hooks")]
             Arc::new(super::super::TestHooks::default()),
         )
@@ -833,9 +1697,10 @@ mod tests {
             schema: Arc::new(ArrowSchema::empty()),
         };
         let registry = RequestBodyRegistry::default();
-        let client = FlightClient::new(
+        let client = FlightClient::new(super::CompressedSizeChannel::new(
             tonic::transport::Channel::from_static("http://127.0.0.1:1").connect_lazy(),
-        );
+            None,
+        ));
         let options = ArrowStreamConfigurationOptions::default();
 
         {
@@ -844,6 +1709,8 @@ mod tests {
                 &table_properties,
                 &options,
                 &registry,
+                None,
+                None,
                 #[cfg(feature = "test-hooks")]
                 Arc::new(super::super::TestHooks::default()),
             );
@@ -878,6 +1745,7 @@ mod tests {
             &ArrowStreamConfigurationOptions::default(),
             &headers_provider,
             "test-sdk",
+            None,
         )
         .await
         .unwrap();
@@ -885,6 +1753,10 @@ mod tests {
         let authorization = client.metadata().get("authorization").unwrap();
         assert!(authorization.is_sensitive());
         assert_eq!(authorization.to_str().unwrap(), "Bearer secret-token");
+
+        let binary = client.metadata().get_bin("x-custom-bin").unwrap();
+        assert_eq!(binary.to_bytes().unwrap().as_ref(), b"\0\xff\r\n");
+        assert!(binary.is_sensitive());
 
         let custom_header = client.metadata().get("x-custom-header").unwrap();
         assert!(!custom_header.is_sensitive());

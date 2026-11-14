@@ -1,29 +1,23 @@
 # NEXT CHANGELOG
 
-## Release v0.2.0
+## Release v0.5.0
 
 ### New Features and Improvements
 
-### Bug Fixes
+- Arrow Flight streams now compress IPC payloads with ZSTD by default.
+  `ArrowStreamOptions::ipc_compression` defaults to `IpcCompression::Zstd` instead of
+  `IpcCompression::NoCompression`. To keep sending uncompressed payloads, set it to
+  `IpcCompression::NoCompression`.
 
-- Fixed a use-after-free in which a custom `HeadersProvider` could be destroyed
-  while the Rust core was still inside a `get_headers()` call into it during
-  connection recovery. Provider ownership is now handed to the FFI as a
-  heap-allocated `shared_ptr` released by a destroy callback
-  (`detail::zerobus_cpp_headers_free`) only after any in-flight `get_headers()`
-  has returned; the `Stream` / `ArrowStream` no longer keeps its own provider
-  `shared_ptr`. Public API is unchanged — `create_stream` /
-  `create_arrow_stream` still take a `std::shared_ptr<HeadersProvider>` — and you
-  no longer need to keep your own reference alive past `create_stream`.
+### Bug Fixes
 
 ### Documentation
 
-- Corrected custom-header examples and clarified that acknowledgment callbacks
-  run once per logical ingest submission rather than once per record in a batch.
-- Recovery after a flush timeout now treats unacked retrieval failure as an
-  active stream rather than assuming the stream is terminal.
-- Arrow Flight schema validation is documented at stream creation (the schema IPC
-  bytes passed to `create_arrow_stream`), not on the first ingested batch.
+- Documented the GCP workspace URL and Zerobus endpoint formats. The formats for
+  AWS, Azure, and GCP now live in one [connection URL
+  table](https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id),
+  and this SDK's README, examples, and API docs link to it instead of repeating
+  cloud-specific URLs.
 
 ### Internal Changes
 

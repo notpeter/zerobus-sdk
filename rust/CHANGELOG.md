@@ -1,5 +1,589 @@
 # Version changelog
 
+## Release v3.2.0
+
+### Major Changes
+
+### New Features and Improvements
+
+- `HeadersProvider` can now send binary gRPC metadata on both gRPC and Arrow Flight
+  streams. Header names ending in `-bin` take a standard base64 value, with or
+  without padding. The SDK decodes it and sends the bytes as sensitive binary
+  metadata. Previously, these headers failed to send.
+- Added `StreamBuilder::dictionary_handling(ArrowDictionaryHandling)` for Arrow
+  Flight streams. The default, `Hydrate`, decodes dictionary-encoded columns on
+  the client, as before. `Resend` sends them as Arrow IPC dictionaries. `Delta`
+  also sends dictionaries, but when a batch's dictionary starts with the
+  previous batch's values for that column, it sends only the new values.
+  Zerobus does not support Arrow dictionaries yet, so keep the default. Until
+  it does, `Resend` or `Delta` with dictionary-encoded columns makes stream
+  creation fail with `ZerobusError::InvalidSchema`.
+- Added `TlsSettings::with_ca_certificate_file` and
+  `TlsSettings::with_client_identity_files` to load CA certificates and the
+  mutual TLS client identity from PEM files, so rotated certificates take
+  effect without a restart or a custom `TlsConfig`. A missing, unreadable,
+  non-regular or oversized file gives a non-retryable
+  `ZerobusError::InvalidArgument` with the path. Unusable content read from a
+  file, such as a certificate that doesn't match the key, gives a retryable
+  `ZerobusError::ChannelCreationError`.
+- The SDK now calls `TlsConfig::tls_settings()` before it reuses a gRPC channel
+  for a new stream or a recovery attempt, and opens a new channel when the
+  settings changed. Rotated certificates now reach a shared channel
+  (`connection_per_stream` off) and gRPC recovery, which used to keep the
+  certificates the channel was opened with. If the settings can't be read or
+  applied at that point, the SDK keeps the current channel and logs a warning.
+  A gRPC stream now opens its first channel inside the recovery retry loop, as
+  Arrow Flight streams already did, so a retryable error there is retried when
+  recovery is enabled.
+
+### Bug Fixes
+
+- An endpoint that isn't a valid URI now gives a non-retryable
+  `ZerobusError::InvalidZerobusEndpointError`, and an SDK identifier that isn't
+  a valid `user-agent` header value gives a non-retryable
+  `ZerobusError::InvalidArgument`. Both used to give a retryable
+  `ChannelCreationError`, so Arrow Flight stream creation retried them until
+  the recovery retries ran out.
+
+### Documentation
+
+- Documented the GCP workspace URL and Zerobus endpoint formats. The formats for
+  AWS, Azure, and GCP now live in one [connection URL
+  table](https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id),
+  and this SDK's README, examples, schema generator, and API docs link to it instead
+  of repeating cloud-specific URLs.
+- The examples read their connection settings from the `ZEROBUS_SERVER_ENDPOINT`,
+  `DATABRICKS_WORKSPACE_URL`, `ZEROBUS_TABLE_NAME`, `DATABRICKS_CLIENT_ID`, and
+  `DATABRICKS_CLIENT_SECRET` environment variables instead of constants in the
+  source.
+
+### Internal Changes
+
+- Moved the table, authentication, record format, and shared retry settings of
+  `StreamBuilder` into a private builder core that other client builders can
+  reuse. Stream behavior is unchanged.
+
+### Breaking Changes
+
+### Deprecations
+
+### API Changes
+
+- Added `ArrowDictionaryHandling`, `StreamBuilder::dictionary_handling`, and
+  `ArrowStreamConfigurationOptions::dictionary_handling` (behind the
+  `arrow-flight` feature).
+
+## Release v3.1.1
+
+### Major Changes
+
+### New Features and Improvements
+
+- Added the `webpki-version-floor` Cargo feature, enabled by default. It
+  carries the `rustls-webpki` 0.103.16 and `webpki-roots` 1.0.11 minimum
+  versions added in 3.0.0, which stop trusting the compromised eMudhra (emSign)
+  CAs. Default builds are unchanged. Builds with `default-features = false` no
+  longer require those versions, so they must enable `webpki-version-floor` or
+  get the eMudhra distrust some other way.
+
+### Bug Fixes
+
+### Documentation
+
+### Internal Changes
+
+### Breaking Changes
+
+### Deprecations
+
+### API Changes
+
+## Release v3.1.0
+
+### Major Changes
+
+### New Features and Improvements
+- Added `StreamBuilder::compression` and `ArrowCompression` (`IpcZstd`,
+  `IpcLz4`, `GrpcZstd`, or `Uncompressed`) to choose Arrow Flight payload
+  compression with one setting. `GrpcZstd` compresses each whole gRPC request
+  message, including the IPC header and alignment padding that IPC compression
+  leaves raw, which sends fewer bytes for wide or sparse schemas. Its buffers
+  are sent without IPC compression and with 8-byte alignment, and it can use
+  more client CPU than `IpcZstd`. With it, `BatchStats::approximate_wire_bytes`
+  counts bytes after gRPC compression. The default leaves the wire format
+  unchanged.
+
+### Bug Fixes
+
+### Documentation
+
+### Internal Changes
+
+### Breaking Changes
+
+### Deprecations
+
+- Deprecated `StreamBuilder::ipc_compression` and the
+  `ArrowStreamConfigurationOptions::ipc_compression` field in favor of
+  `StreamBuilder::compression` and the `compression` field. They keep working:
+  of the two setters, the last call wins, and the deprecated field applies while
+  `compression` is `ArrowCompression::FallbackToLegacy`, its default. That
+  variant is deprecated too and will be removed with the field.
+
+### API Changes
+
+## Release v3.0.0
+
+### Major Changes
+
+### New Features and Improvements
+
+- Arrow Flight streams with IPC compression now pad IPC buffers to a multiple
+  of 8 bytes instead of 64. With compression, 64-byte alignment gives no
+  benefit and only adds padding bytes to the payload. Uncompressed payloads
+  keep 64-byte alignment.
+- Zeroparser's `MessageRegistry` is now aligned to 128 bytes. When threads
+  share one registry and clone its `Arc` for every record, the reference
+  counts were on the same cache line as the registry fields that the parser
+  reads, which made parsing several times slower on many threads.
+
+### Bug Fixes
+
+- The crate now requires `rustls-webpki` 0.103.16 or later and `webpki-roots`
+  1.0.11 or later. These releases stop trusting the compromised eMudhra (emSign)
+  CAs: rustls-webpki rejects chains through the emSign G3 issuing CAs, and the
+  bundled root set no longer includes the emSign G3, C3 and C1 roots.
+  Upgrading the SDK is enough to pick up the fix. The crate does not use either
+  dependency directly; it declares them only to set the minimum versions.
+
+### Documentation
+
+- Documented persistent streams (behind the `eos` feature) in the Rust README,
+  with a usage section, API reference entries, and a runnable JSON example that
+  creates a durable stream, ingests in a loop with one `flush()`, and resumes by
+  `stream_id`.
+
+### Internal Changes
+
+- Added a stateful persistent-stream mock and integration coverage for create,
+  flush, resume offset continuity, and unknown stream IDs.
+
+- The mock gRPC server used by the repository's tests moved to an unpublished
+  `test-support` crate that generates its own server bindings, and the SDK no
+  longer generates gRPC server code.
+
+### Breaking Changes
+
+- Bumped the Arrow dependencies (`arrow-array`, `arrow-schema`, `arrow-ipc`, and
+  the vendored `arrow-flight` fork) from `59.2` to `60.0`. The vendored
+  `arrow-flight` crate was re-synced to upstream `60.0.0` with the slice-aware
+  batch-split fix (arrow-rs#9388 / #5352) re-applied. Because the SDK re-exports
+  Arrow types through its public API, consumers using the `arrow-flight`
+  feature that exchange those types with the SDK must upgrade their own Arrow
+  dependency to `60.x`; Arrow `59` and `60` types cannot be mixed in the same
+  build. Arrow `60` requires Rust 1.88 or newer. Consumers on the default build
+  (without the `arrow-flight` feature) are unaffected.
+
+- Added `#[non_exhaustive]` to the `EncodedRecord`, `EncodedBatch`, and
+  `EncodedBatchIter` enums, and to the doc-hidden `PreparedInput`. Enabling the
+  `avro` feature anywhere in a build, or adding a record format in a later
+  release, no longer breaks exhaustive matches in other crates
+  ([#909](https://github.com/databricks/zerobus-sdk/issues/909)).
+
+  Migration: add a `_ => { … }` arm to any `match` on these enums, such as one
+  over the records returned by `get_unacked_records()` or
+  `get_unacked_batches()`.
+
+- Removed `tonic` types from the public API. `tonic` is pre-1.0, and each 0.x
+  minor release is a breaking change, so a `tonic` upgrade no longer breaks the
+  SDK API. Two parts of the API named `tonic` types:
+
+  - `ZerobusError::CreateStreamError` and `ZerobusError::StreamClosedError` now
+    carry a `GrpcStatus` instead of a `tonic::Status`. `GrpcStatus::code()`
+    returns a `GrpcCode` (`#[non_exhaustive]`, 17 gRPC status codes) and
+    `GrpcStatus::message()` returns the message. The `Display` output is the
+    same as the output of `tonic::Status` today, so error strings do not change.
+    Retry and authentication classification do not change. The status no longer
+    exposes `tonic::Status` details and metadata.
+
+    Migration: compare `status.code()` with `GrpcCode` and not with
+    `tonic::Code`. For example, replace `tonic::Code::Unauthenticated` with
+    `GrpcCode::Unauthenticated`.
+
+  - `TlsConfig::configure_endpoint(&self, Endpoint) -> ZerobusResult<Endpoint>`
+    is now `TlsConfig::tls_settings(&self) -> ZerobusResult<TlsSettings>`.
+    `TlsSettings` describes the TLS setup of the channel: the system CA
+    certificates (the default), more CA certificates, a client identity for
+    mutual TLS, a domain-name override, and plaintext for tests. The SDK
+    applies the settings to the endpoint and calls `tls_settings()` for every
+    new channel, so an implementation can still rotate certificates.
+    `SecureTlsConfig` and `NoTlsConfig` keep their behavior.
+
+    Migration: return a `TlsSettings` from `tls_settings()`. For example,
+    replace `ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem))`
+    with `TlsSettings::new().without_native_roots().with_ca_certificate_pem(pem)`.
+    `ClientTlsConfig::new()` trusts no system CA certificates, and
+    `TlsSettings::new()` does, so `without_native_roots()` keeps the old
+    behavior. A `TlsConfig` can no longer change settings of the gRPC endpoint
+    that are not TLS settings.
+    You no longer need a `tonic` dependency to implement `TlsConfig`.
+
+    The SDK now checks the TLS settings when it applies them. With
+    `without_native_roots()`, it rejects a CA entry that holds no PEM
+    certificate, because the channel would otherwise trust no server. It also
+    reports a CA or a client identity that it cannot use as
+    `ZerobusError::InvalidArgument`, which is not retryable, so recovery does
+    not retry the mistake. `FailedToEstablishTlsConnectionError` is still the
+    error for other TLS setup failures.
+
+- `schema::UcColumn` and `schema::UcTableSchema` are now `#[non_exhaustive]`,
+  so they can no longer be built with struct literals outside the SDK. Use
+  `UcColumn::new(name, type_name)` with the `with_type_text`, `with_type_json`,
+  `with_nullable`, and `with_position` setters, and
+  `UcTableSchema::new(catalog_name, schema_name, name, columns)`. Fields stay
+  public for reading, and deserializing from the Unity Catalog API response is
+  unchanged. New Unity Catalog fields can now be added in minor releases.
+
+- The generated protobuf/gRPC types are no longer public:
+  `databricks_zerobus_ingest_sdk::databricks::zerobus` has been removed
+  ([#822](https://github.com/databricks/zerobus-sdk/issues/822)), so later
+  additions to the wire protocol aren't breaking changes.
+  `StreamConfigurationOptions::record_type` is now the SDK-owned `RecordType`
+  (`Proto`, `Json`, and `Avro` with the `avro` feature), which is
+  `#[non_exhaustive]` and has no `Unspecified` variant. Import
+  `databricks_zerobus_ingest_sdk::RecordType` instead. The stream builder API
+  and the other-language SDKs are unaffected.
+
+- `EncodedBatch` variants now hold the SDK-owned `BatchRecords<T>` instead of
+  `smallvec::SmallVec<[T; 1]>`, and `EncodedBatchIter` variants hold
+  `BatchRecordsIntoIter<T>` instead of `smallvec::IntoIter<[T; 1]>`, so a
+  `smallvec` upgrade no longer breaks the SDK API
+  ([#912](https://github.com/databricks/zerobus-sdk/issues/912)). A
+  single-record batch is still stored inline.
+
+  Migration: `BatchRecords` derefs to `[T]`, implements `IntoIterator`,
+  `FromIterator`, `From<Vec<T>>`, `AsRef<[T]>`, `Borrow<[T]>`, and `Hash`, and
+  converts to a `Vec` with `into_vec()` or `Vec::from`. Replace `smallvec![..]`
+  or `SmallVec::from_vec(v)` with `v.into()`, and `as_slice()` with
+  `&records[..]`. `BatchRecords` is read-only, so assigning through an index,
+  `sort()`, `iter_mut()`, and other mutating slice methods no longer compile.
+  To modify records, call `into_vec()`, edit the `Vec`, and convert it back
+  with `.into()`.
+
+### Deprecations
+
+### API Changes
+
+- Added `GrpcStatus` and `GrpcCode`. Use them to inspect
+  `ZerobusError::CreateStreamError` and `ZerobusError::StreamClosedError`.
+- Added `TlsSettings`. It implements `TlsConfig`, so you can pass it to
+  `ZerobusSdkBuilder::tls_config` in an `Arc`. Its `Debug` output does not print
+  key or certificate material.
+- Added `UcColumn::new`, `UcColumn::with_type_text`, `UcColumn::with_type_json`,
+  `UcColumn::with_nullable`, `UcColumn::with_position`, and
+  `UcTableSchema::new`.
+- Added `RecordType`.
+- Added `BatchRecords` and `BatchRecordsIntoIter`.
+
+## Release v2.12.0
+
+### Major Changes
+
+### New Features and Improvements
+
+- Added the feature-gated `PersistentStream` API for creating durable ingestion
+  streams and resuming them by `stream_id` from the last committed offset.
+- Arrow Flight streams now compress IPC payloads with ZSTD by default.
+  `ArrowStreamConfigurationOptions::ipc_compression` defaults to
+  `Some(CompressionType::ZSTD)` instead of `None`. To keep sending uncompressed
+  payloads, call `.ipc_compression(None)` on the stream builder.
+
+- Added Rust-only multiplexed Arrow Flight streams via
+  `.arrow(schema).multiplexed(n).build_arrow()`. Whole batches route round-robin
+  with a mux-wide `max_inflight_batches` budget, lane-local recovery, and the
+  existing mux poisoning and message-ID semantics.
+
+- Standard gRPC streams (JSON and Protocol Buffers) send fewer duplicate
+  records after a server close signal and after `close()`. When records are
+  still unacknowledged after the graceful-close wait, the SDK now half-closes the
+  stream and applies the acknowledgments the server sends for up to 500 ms. If
+  you set `stream_paused_max_wait_time_ms(Some(0))`, recovery can take up to
+  500 ms longer when records are unacknowledged and the server has not ended the
+  stream.
+
+### Bug Fixes
+
+- Arrow `ingest_batch` calls blocked on `max_inflight_batches` now fail as soon as
+  `close()` starts instead of waiting for close to finish.
+
+### Documentation
+
+- Documented Arrow mux lifecycle, capacity, partial-ack recovery, and telemetry
+  restrictions; added the `arrow_multiplexed` example.
+
+### Internal Changes
+
+- Extracted a private transport-generic mux core and lane contract. The gRPC
+  mux keeps its existing behavior, while each lane owns its close and recovery
+  paths.
+
+### Breaking Changes
+
+### Deprecations
+
+### API Changes
+
+- Added `MultiplexedArrowStream` and `MultiplexedStreamBuilder::build_arrow()`
+  behind the `arrow-flight` feature, with batch and IPC ingestion, message waits,
+  flush, close, and unacknowledged-batch retrieval.
+
+## Release v2.11.0
+
+### Major Changes
+
+### New Features and Improvements
+
+- Added Avro support to `StreamBuilder::multiplexed(n)` (Beta) when the `avro`
+  feature is enabled; every lane shares the configured writer schema.
+- Added first-class external-IdP token federation (`FederatedTokenProvider`,
+  `IdpTokenSupplier`) alongside the existing OAuth client-credentials path. It
+  exchanges an external IdP token (for example an Entra ID token) for a
+  Zerobus-scoped Databricks token via the RFC 8693 token-exchange grant, caches
+  and refreshes it through the existing `TokenCache`, and supports both
+  account-level federation (no `client_id`, identity synced via Automatic
+  Identity Management) and workload identity federation (a service principal
+  `client_id` with no secret). Opt in via `StreamBuilder::federated_auth(supplier,
+  client_id)`, where `client_id` is `None` for account-level federation or the
+  service principal id for workload identity. The client-credentials and
+  token-exchange grants now share one request-shaping path, keeping them at
+  parity. The cached lifetime of an exchanged token is additionally capped at the
+  subject JWT's remaining life (`min(expires_in, exp - now)`), so it is never
+  served past the point its subject token expired. The shared token cache is
+  partitioned by identity so entries never collide — workload keys by its service
+  principal `client_id`, account-level by the supplier's own identity — so two
+  distinct identities driven from one SDK instance never serve each other's token
+  on the same table, without the caller passing a partition key (clone one
+  supplier across streams to share its cached token; pass a distinct supplier to
+  isolate). Existing `oauth(...)` and `headers_provider(...)` paths are unchanged.
+
+### Bug Fixes
+
+- Fixed Avro (`avro` feature, Beta) encoding of `fixed(16)` + `logicalType:
+  "uuid"` columns. Bumped `apache-avro` to 0.22, which preserves the `fixed(16)`
+  backing (`Schema::Uuid(UuidSchema::Fixed)`) and encodes `AvroValue::Uuid` as 16
+  raw bytes instead of the 37-byte hyphenated string a `fixed(16)` server column
+  could not decode. `string` + `uuid` columns are unchanged.
+
+### Documentation
+
+- Added a multiplexed Avro example using loop-then-flush ingestion.
+
+### Internal Changes
+
+- Added the feature-gated persistent gRPC transport, durable wire offsets,
+  resume-watermark reconciliation after a lost acknowledgment, and validation
+  for setup responses, acknowledgment bounds, and offset overflow.
+
+### Breaking Changes
+
+### Deprecations
+
+### API Changes
+
+## Release v2.10.0
+
+### Major Changes
+
+### New Features and Improvements
+
+- Added `StreamBuilder::multiplexed(n)` (Beta) for JSON and protobuf streams, with
+  concurrent construction, a shared in-flight budget, and a separate
+  `multiplexed_ack_callback` for `MessageId` notifications. Existing ordinary
+  `ack_callback` usage is unchanged.
+- Multi-lane multiplexed construction opens sub-streams concurrently with
+  bounded random startup jitter and cleans up successful opens if construction
+  fails or is cancelled. A single lane opens immediately.
+- Multiplexed streams divide the mux-wide `max_inflight_requests` budget evenly
+  across sub-streams.
+
+### Bug Fixes
+
+- Restored the established gRPC stream error contract after exhausted recovery:
+  `wait_for_offset()`, `flush()`, and an in-progress `close()` now report the
+  final recovery setup failure as `StreamClosedError` while preserving its gRPC
+  status. Initial stream construction still reports `CreateStreamError`.
+
+- Cancelled gRPC stream construction now cancels and aborts supervisor,
+  callback, sender, and receiver tasks before ownership is returned. This
+  applies to ordinary and multiplexed stream builds.
+
+### Documentation
+
+- Added multiplexed-stream guidance and a complete compiled-protobuf example
+  with queued ingestion, periodic flushing, `MessageId` callbacks, and close.
+
+### Internal Changes
+
+- Made gRPC graceful-close deadline tests deterministic with a paused clock and
+  acknowledgment barriers, avoiding false failures from Windows scheduling delays.
+
+### Breaking Changes
+
+### Deprecations
+
+### API Changes
+
+- Exported `MultiplexedStream`, `MultiplexedStreamBuilder`, and `MessageId` with
+  default features.
+- Added `StreamBuilder::multiplexed_ack_callback` for `MessageId` callbacks
+  while preserving `ack_callback` for ordinary `OffsetId` callbacks; each
+  terminal mode rejects the other mode's callback.
+- Added `MultiplexedStream::new_record()` for dynamic-protobuf records.
+
+## Release v2.9.0
+
+### Major Changes
+
+### New Features and Improvements
+
+- Add Avro record format (Beta), behind the off-by-default `avro` feature. Select it with
+  `StreamBuilder::avro(schema_json)`, then ingest an `AvroRecord(AvroValue)` the stream
+  encodes against the writer schema, or a pre-encoded `AvroBytes`. Ephemeral streams only;
+  requires Rust 1.85 (via `apache-avro`); feature in development.
+
+- JSON and protobuf streams now use a dedicated gRPC connection by default.
+  Use `ZerobusSdk::builder().connection_per_stream(false)` to retain the prior
+  shared HTTP/2 connection behavior. Arrow Flight streams are unchanged.
+- Added pluggable Arrow Flight telemetry (Beta) for batch sizes, send attempts,
+  acknowledgments, and reconnect reasons, via `StatsExporter` and `channel_exporter`.
+
+### Bug Fixes
+
+- Bounded the post-abort supervisor wait during gRPC stream close, including
+  when a synchronous credentials callback is blocked.
+
+### Documentation
+
+### Internal Changes
+
+- Updated multiplexed-stream failure handling to reject new ingestion after a
+  mux operation observes a failed lane, preserve typed lane errors, wait for
+  healthy lanes during flush, and close lanes concurrently. Healthy lanes stay
+  active until explicit close or drop. Message acknowledgment waits remain
+  scoped to their own lane.
+- Fixed interrupted mux close so retrying finishes callback draining and lane
+  finalization without repeating a completed flush attempt or losing the
+  terminal error, preserving access to unacknowledged records.
+
+### Breaking Changes
+
+- **Adding the Avro record type extends the publicly re-exported gRPC types, which
+  can break compilation for some downstream crates.** The additions
+  (`RecordType::AVRO`, `CreateIngestStreamRequest.avro_schema_json`,
+  `IngestRecordRequest.avro_encoded_record`, `IngestRecordBatchRequest.avro_batch`, and
+  the new `AvroRecordBatch`) are wire-compatible — no runtime or behavior change. But
+  because the crate re-exports the prost-generated types
+  (`databricks_zerobus_ingest_sdk::databricks::zerobus`), code that matches or builds
+  them exhaustively will no longer compile. The builder API (`.json()`,
+  `.compiled_proto()`, `.dynamic_proto()`) and the other-language SDKs are unaffected.
+  The long-term fix (hiding these generated types) is tracked in
+  [#822](https://github.com/databricks/zerobus-sdk/issues/822).
+
+  Migration — every fix is additive:
+  - Exhaustive `match` on `RecordType` with no `_` arm → add `_ => { … }` (or a
+    `RecordType::Avro` arm). (E0004)
+  - Exhaustive `match` on the `ingest_record_request::Record` or
+    `ingest_record_batch_request::Batch` oneof → add a `_ => { … }` arm. (E0004)
+  - Full-field struct literal of `CreateIngestStreamRequest` → add
+    `..Default::default()`. (E0063)
+  - Full-field struct pattern/destructuring of `CreateIngestStreamRequest`
+    (e.g. `let CreateIngestStreamRequest { table_name, descriptor_proto, record_type } = req`)
+    → add `..`. (E0027)
+  - **Only in crates that enable the `avro` feature:** the SDK's own `EncodedRecord` /
+    `EncodedBatch` enums (not `#[non_exhaustive]`) gain an `Avro` variant. Exhaustive
+    `match` on either with no `_` arm → add an `EncodedRecord::Avro(..)` /
+    `EncodedBatch::Avro(..)` arm (or `_ => { … }`). (E0004)
+
+  Unaffected: `x == RecordType::Json`, any `match` that already has a `_` arm, and
+  struct literals/patterns that already use `..`.
+
+### Deprecations
+
+### API Changes
+
+- Added the Avro wire surface to the generated gRPC types (`RecordType::AVRO`,
+  `CreateIngestStreamRequest.avro_schema_json`, `IngestRecordRequest.avro_encoded_record`,
+  `IngestRecordBatchRequest.avro_batch`, `AvroRecordBatch`). See **Breaking Changes** for
+  the downstream-compilation impact and migration.
+
+- `ZerobusStream::ingest_record_offset` / `ingest_records_offset` (and the `testing`-only
+  multiplexed equivalents) now accept `impl Into<PreparedInput>` instead of
+  `impl Into<EncodedRecord>`. A blanket `From<T: Into<EncodedRecord>>` keeps every existing
+  caller compiling unchanged; the wider bound is what lets an Avro record object
+  (`AvroRecord`) be ingested. `PreparedInput` is `#[doc(hidden)]`.
+
+## Release v2.8.0
+
+### Major Changes
+
+### New Features and Improvements
+
+- Promoted Arrow Flight ingestion to general availability across its APIs,
+  documentation, and examples. The `arrow-flight` Cargo feature remains opt-in.
+
+### Bug Fixes
+
+- Fixed multiplexed-stream admission during terminal sub-stream failure so
+  accepted records are retained for recovery, capacity waiters keep their FIFO
+  position, and waits fail after 30 seconds with actionable timeout context.
+- The OAuth `expires_in` field is now parsed from a quoted integer (`"3600"`) in
+  addition to a plain JSON integer. A value that is missing or does not represent
+  a positive integer still yields no token lifetime, as before.
+- OAuth token lifetime is now anchored to when the token request starts rather
+  than when the response arrives, so a slow response no longer makes the SDK treat
+  a token as valid longer than the issuer does. A token already past its
+  (start-anchored) expiry is dead on arrival and surfaces a retryable
+  `TokenFetchError` when there is no still-valid cached token to serve instead,
+  including when the token cache is disabled.
+- A stalled proactive token refresh no longer hangs stream creation. For streams
+  built with `.oauth(...)`, the refresh is capped at half the stream's configured
+  setup budget (`recovery_timeout_ms`) — but only when the cached token has more
+  life left than that cap, so a hung endpoint becomes a prompt failure and the
+  still-valid cached token is served in time. When too little of the token's life
+  remains for that fallback to help, the refresh runs unbounded (like a cold miss)
+  so a slow-but-working mint isn't cut off early.
+- When a proactive token refresh fails — for any error, including a non-retryable
+  one such as revoked credentials — the still-valid cached token is served rather
+  than failing the caller. The token was validly issued and hasn't expired, and the
+  server re-validates it on every connection, so the error surfaces only when there
+  is no still-valid token to fall back to. A refresh that returns a dead-on-arrival
+  token falls back the same way.
+- After a proactive refresh falls back to the cached token, a short backoff paces
+  further attempts so a burst of stream creations cannot turn one token-endpoint
+  failure into a mint stampede. The interval scales with the configured token
+  refresh buffer and shrinks as the token nears expiry, down to a floor, and never
+  extends past expiry.
+- OAuth credential invalidation after an auth rejection is more precise and never
+  waits on an in-flight mint. Each cached token carries a monotonic generation, and
+  invalidation records the rejected generation on the cache entry with a lock-free
+  atomic, so it never takes the per-token lock or detaches a mint. A token at or
+  below the recorded generation is dropped before its next use and is never refreshed
+  from, so the next fetch re-mints; a newer token installed by a concurrent refresh
+  has a higher generation and is kept and reused.
+
+### Documentation
+
+### Internal Changes
+
+### Breaking Changes
+
+### Deprecations
+
+### API Changes
+
+- Added the in-development persistent-stream protobuf contract for creating,
+  resuming, ingesting into, and retiring durable streams.
+
 ## Release v2.7.1
 
 ### Major Changes

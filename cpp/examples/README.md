@@ -8,7 +8,7 @@ ingest data into Databricks Delta tables.
 - [Overview](#overview)
 - [JSON Examples](json/README.md)
 - [Protocol Buffers Examples](proto/README.md)
-- [Arrow Flight Examples](arrow/README.md) (Beta)
+- [Arrow Flight Examples](arrow/README.md)
 - [Prerequisites](#prerequisites)
   - [Create a Databricks Table](#1-create-a-databricks-table)
   - [Set Up OAuth Service Principal](#2-set-up-oauth-service-principal)
@@ -30,7 +30,7 @@ columnar `ArrowStream`:
 - **[Protocol Buffers](proto/README.md)** — Type-safe binary encoding. The
   examples build the descriptor at runtime from Unity Catalog metadata
   (`ProtoSchema::from_uc_json`), so **no `.proto` file or `protoc` is required**.
-- **[Arrow Flight](arrow/README.md)** (Beta) — Columnar Arrow `RecordBatch`
+- **[Arrow Flight](arrow/README.md)** — Columnar Arrow `RecordBatch`
   ingestion over the Arrow Flight protocol.
 
 Beyond the basic ingestion flow, several examples also demonstrate advanced
@@ -56,7 +56,7 @@ failure in [`json/single.cpp`](json/single.cpp), and Arrow IPC compression in
 | [JSON Batch](json/README.md#batch-example) | JSON | Batch | `json_batch` |
 | [Proto Single](proto/README.md#single-record-example) | Protocol Buffers | Single-record | `proto_single` |
 | [Proto Batch](proto/README.md#batch-example) | Protocol Buffers | Batch | `proto_batch` |
-| [Arrow](arrow/README.md) | Arrow Flight (Beta) | `RecordBatch` | `arrow_ingest` |
+| [Arrow](arrow/README.md) | Arrow Flight | `RecordBatch` | `arrow_ingest` |
 
 ## Prerequisites
 
@@ -93,17 +93,16 @@ Replace `catalog.schema.orders` with your actual catalog, schema, and table name
 
 Every example reads its connection settings from the environment, so no value is
 ever baked into source. Export these five variables before running any example
-(the same names the Go, TypeScript, Java, and Python SDK examples use):
+(every released SDK's examples read the same variables). Find the connection values
+in the [connection URL table](https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id):
 
 ```bash
-export ZEROBUS_SERVER_ENDPOINT="https://<your-shard-id>.zerobus.<region>.cloud.databricks.com"
-export DATABRICKS_WORKSPACE_URL="https://<your-workspace>.cloud.databricks.com"
+export ZEROBUS_SERVER_ENDPOINT="<your-zerobus-server-endpoint>"
+export DATABRICKS_WORKSPACE_URL="<your-databricks-workspace-url>"
 export ZEROBUS_TABLE_NAME="catalog.schema.orders"
 export DATABRICKS_CLIENT_ID="<your_databricks_client_id>"
 export DATABRICKS_CLIENT_SECRET="<your_databricks_client_secret>"
 ```
-
-For Azure, use `.azuredatabricks.net` hosts in the endpoint and workspace URL.
 
 The proto examples additionally read the Unity Catalog table metadata JSON from
 the environment (the JSON examples don't). See the [Protocol Buffers
@@ -123,9 +122,8 @@ export ZEROBUS_UC_TABLE_JSON="$(curl -sS --fail \
 ```
 
 **How to get these values:**
-- **ZEROBUS_SERVER_ENDPOINT** — Zerobus ingestion endpoint (usually
-  `https://<shard-id>.zerobus.<region>.cloud.databricks.com`).
-- **DATABRICKS_WORKSPACE_URL** — your Databricks workspace URL (Unity Catalog endpoint).
+- **ZEROBUS_SERVER_ENDPOINT** — your Zerobus ingestion endpoint from the connection URL table.
+- **DATABRICKS_WORKSPACE_URL** — your Databricks workspace URL, used for Unity Catalog and OAuth.
 - **ZEROBUS_TABLE_NAME** — full table name in the form `catalog.schema.table`.
 - **DATABRICKS_CLIENT_ID / DATABRICKS_CLIENT_SECRET** — OAuth 2.0 credentials from your
   service principal.
@@ -206,7 +204,7 @@ zerobus::Stream stream =
     sdk.create_stream(props, client_id, client_secret, options);
 ```
 
-**Arrow Flight (Beta):**
+**Arrow Flight:**
 ```cpp
 zerobus::ArrowStream stream =
     sdk.create_arrow_stream(table_name, schema_ipc_bytes, client_id,

@@ -1,4 +1,4 @@
-//! Ingestion stream over the gRPC transport (proto / JSON records).
+//! JSON and Protocol Buffer ingestion stream.
 //!
 //! `ZerobusStream` is the main user-facing type for streaming records into a
 //! Delta table. This module owns the struct, the constructor that wires
@@ -11,10 +11,12 @@
 //! |-----------------------|----------------------------------------------------|--------------------|
 //! | `types.rs`            | Internal types (`IngestRequest`, channel messages) | Transport-agnostic |
 //! | `ingest.rs`           | Public `ingest_*` methods                          | Transport-agnostic |
+//! | `mux_lane.rs`         | Private mux lane hooks and gRPC adapter            | gRPC-specific      |
 //! | `acks.rs`             | `flush`, `wait_for_offset`, unacked queries        | Transport-agnostic |
 //! | `close.rs`            | `close`, `is_closed`, task shutdown                | Transport-agnostic |
 //! | `callback_handler.rs` | User-callback dispatch task                        | Transport-agnostic |
 //! | `connection.rs`       | gRPC bidirectional stream setup                    | gRPC-specific      |
+//! | `transport.rs`        | Ephemeral/persistent RPC seam (`eos`)              | gRPC-specific      |
 //! | `sender.rs`           | Outbound gRPC sender task                          | gRPC-specific      |
 //! | `receiver.rs`         | Inbound gRPC receiver task                         | gRPC-specific      |
 //! | `supervisor.rs`       | Create → spawn → recover loop                      | gRPC-specific      |
@@ -25,10 +27,9 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Channel;
 use tracing::instrument;
 
-use crate::databricks::zerobus::zerobus_client::ZerobusClient;
+use crate::grpc_channel::GrpcChannelSource;
 use crate::landing_zone::LandingZone;
 use crate::{
     DynamicRecord, HeadersProvider, MessageDescriptor, OffsetId, OffsetIdGenerator,
@@ -40,25 +41,29 @@ mod callback_handler;
 mod close;
 mod connection;
 mod ingest;
+mod mux_lane;
 mod receiver;
 mod sender;
 mod supervisor;
+mod transport;
 mod types;
 
+use transport::GrpcConnectionMode;
 use types::{IngestRequest, OneshotMap, RecordLandingZone};
 
 #[cfg(feature = "testing")]
 pub use callback_handler::CallbackHandlerHarness;
 
-/// Maximum time to wait for the receiver/sender tasks to finish during stream
-/// teardown.
+/// Maximum time to read the response stream after the request stream ends, and to wait
+/// for the receiver/sender tasks to finish during stream teardown.
 pub(super) const STREAM_TEARDOWN_DRAIN_TIMEOUT_MS: u64 = 500;
 
 /// Represents an active ingestion stream to a Databricks Delta table.
 ///
-/// A `ZerobusStream` manages a bidirectional gRPC stream for ingesting records into
-/// a Unity Catalog table. It handles authentication, automatic recovery, acknowledgment
-/// tracking, and graceful shutdown.
+/// A `ZerobusStream` manages JSON or Protocol Buffer ingestion into
+/// a Unity Catalog table over a bidirectional gRPC stream. It handles
+/// authentication, automatic recovery, acknowledgment tracking, and
+/// graceful shutdown.
 ///
 /// # Lifecycle
 ///
@@ -91,8 +96,16 @@ pub struct ZerobusStream {
     /// not just within a single table. The server returns this ID in the CreateStreamResponse
     /// after validating the table properties and establishing the gRPC connection.
     pub(crate) stream_id: Option<String>,
-    /// Type of gRPC stream that is used when sending records.
+    /// Kind of stream used when sending records.
     pub stream_type: StreamType,
+    /// For a persistent (Eos) stream resumed from a prior session, the offset
+    /// the server had durably committed at resume time (`last_committed_offset`
+    /// from the resume response). `None` for ephemeral streams and for a
+    /// freshly created persistent stream (nothing committed yet). Only read
+    /// through the `eos`-gated accessor.
+    // Used by the feature-gated public API introduced in the downstream PR.
+    #[allow(dead_code)]
+    pub(crate) last_committed_offset: Option<OffsetId>,
     /// Gets headers which are used in the first request to establish connection with the server.
     pub headers_provider: Arc<dyn HeadersProvider>,
     /// The stream configuration options related to recovery, fetching OAuth tokens, etc.
@@ -110,6 +123,8 @@ pub struct ZerobusStream {
     /// Supervisor task that manages the stream lifecycle such as stream creation, recovery, etc.
     /// It orchestrates the receiver and sender tasks.
     supervisor_task: tokio::task::JoinHandle<Result<(), ZerobusError>>,
+    /// Cached outcome of the bounded supervisor shutdown attempt.
+    supervisor_shutdown_result: Option<ZerobusResult<()>>,
     /// The generator of logical offset IDs. Used to generate monotonically increasing offset IDs, even if the stream recovers.
     logical_offset_id_generator: OffsetIdGenerator,
     /// Signal that the stream is caught up to the given offset.
@@ -122,28 +137,131 @@ pub struct ZerobusStream {
     is_closed: Arc<AtomicBool>,
     /// Sync mutex to ensure that offset generation and record ingestion happen atomically.
     sync_mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Persistent signal that wakes capacity waiters when the stream becomes terminal.
+    terminal_token: CancellationToken,
     /// Watch channel for last error received from the server.
     server_error_rx: tokio::sync::watch::Receiver<Option<ZerobusError>>,
     /// Cancellation token to signal receiver and sender tasks to abort. It is sent either when stream is closed or dropped.
     cancellation_token: CancellationToken,
     /// Callback handler task that executes callbacks in a separate thread.
     callback_handler_task: Option<tokio::task::JoinHandle<()>>,
+    /// Stops the callback handler task. Close cancels it only after the supervisor has shut
+    /// down, so acks applied during that shutdown still reach the callback.
+    callback_cancellation_token: CancellationToken,
     /// Resolved message descriptor for building dynamic-proto records, supplied by
     /// the builder. `None` for JSON and compiled-proto streams.
     dynamic_message_descriptor: Option<MessageDescriptor>,
+}
+
+/// Owns tasks spawned while a stream is opening. If the constructor future is
+/// cancelled before it can move those handles into `ZerobusStream`, dropping
+/// this guard cancels and aborts them instead of detaching them.
+type StreamInitializationTasks = (
+    tokio::task::JoinHandle<Result<(), ZerobusError>>,
+    Option<tokio::task::JoinHandle<()>>,
+);
+
+struct StreamInitializationGuard {
+    cancellation_token: CancellationToken,
+    tasks: Option<StreamInitializationTasks>,
+}
+
+impl StreamInitializationGuard {
+    fn new(
+        cancellation_token: CancellationToken,
+        supervisor_task: tokio::task::JoinHandle<Result<(), ZerobusError>>,
+        callback_handler_task: Option<tokio::task::JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            cancellation_token,
+            tasks: Some((supervisor_task, callback_handler_task)),
+        }
+    }
+
+    fn disarm(mut self) -> StreamInitializationTasks {
+        self.tasks
+            .take()
+            .expect("initialization guard must own its tasks")
+    }
+}
+
+impl Drop for StreamInitializationGuard {
+    fn drop(&mut self) {
+        let Some((supervisor, callback)) = self.tasks.take() else {
+            return;
+        };
+        self.cancellation_token.cancel();
+        // Aborting the supervisor also drops its abort-on-drop IO handles.
+        // No records have been admitted before construction completes.
+        supervisor.abort();
+        if let Some(callback) = callback {
+            callback.abort();
+        }
+    }
 }
 
 impl ZerobusStream {
     /// Creates a new ephemeral stream for ingesting records.
     #[instrument(level = "debug", skip_all)]
     pub(crate) async fn new_stream(
-        channel: ZerobusClient<Channel>,
+        channel: Arc<GrpcChannelSource>,
         table_properties: TableProperties,
         headers_provider: Arc<dyn HeadersProvider>,
         options: StreamConfigurationOptions,
     ) -> ZerobusResult<Self> {
+        Self::new_with_kind(
+            channel,
+            table_properties,
+            headers_provider,
+            options,
+            StreamType::Ephemeral,
+            GrpcConnectionMode::Ephemeral,
+        )
+        .await
+    }
+
+    /// Creates or resumes a persistent (Eos) stream.
+    ///
+    /// With `resume_stream_id = None` the server mints a new stream and its id
+    /// is available via [`stream_id`](Self::stream_id). With `Some(id)` the SDK
+    /// reconnects to an existing persistent stream, reseeds its offset generator
+    /// to continue after the server's committed offset, and re-sends only the
+    /// records the server has not yet durably stored.
+    // Used by the feature-gated public API introduced in the downstream PR.
+    #[allow(dead_code)]
+    #[instrument(level = "debug", skip_all)]
+    pub(crate) async fn new_persistent_stream(
+        channel: Arc<GrpcChannelSource>,
+        table_properties: TableProperties,
+        headers_provider: Arc<dyn HeadersProvider>,
+        options: StreamConfigurationOptions,
+        resume_stream_id: Option<String>,
+    ) -> ZerobusResult<Self> {
+        Self::new_with_kind(
+            channel,
+            table_properties,
+            headers_provider,
+            options,
+            StreamType::Persistent,
+            GrpcConnectionMode::Persistent { resume_stream_id },
+        )
+        .await
+    }
+
+    /// Shared constructor for both stream kinds. Wires the supervisor + IO
+    /// tasks, waits for the first open to complete, and — for a persistent
+    /// resume — reseeds the logical offset generator so records ingested after
+    /// resume continue past the server's committed offset.
+    async fn new_with_kind(
+        channel: Arc<GrpcChannelSource>,
+        table_properties: TableProperties,
+        headers_provider: Arc<dyn HeadersProvider>,
+        options: StreamConfigurationOptions,
+        stream_type: StreamType,
+        kind: GrpcConnectionMode,
+    ) -> ZerobusResult<Self> {
         let (stream_init_result_tx, stream_init_result_rx) =
-            tokio::sync::oneshot::channel::<ZerobusResult<String>>();
+            tokio::sync::oneshot::channel::<ZerobusResult<supervisor::StreamInitInfo>>();
 
         let (logical_last_received_offset_id_tx, _logical_last_received_offset_id_rx) =
             tokio::sync::watch::channel(None);
@@ -153,18 +271,21 @@ impl ZerobusStream {
 
         let oneshot_map = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let is_closed = Arc::new(AtomicBool::new(false));
+        let sync_mutex = Arc::new(tokio::sync::Mutex::new(()));
         let failed_records = Arc::new(RwLock::new(Vec::new()));
         let logical_offset_id_generator = OffsetIdGenerator::default();
 
         let (server_error_tx, server_error_rx) = tokio::sync::watch::channel(None);
         let cancellation_token = CancellationToken::new();
+        let terminal_token = CancellationToken::new();
+        let callback_cancellation_token = CancellationToken::new();
         // Create callback channel and spawn callback handler task only if callback is defined
         let (callback_tx, callback_handler_task) = if options.ack_callback.is_some() {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let task = Self::spawn_callback_handler_task(
                 rx,
                 options.ack_callback.clone(),
-                cancellation_token.clone(),
+                callback_cancellation_token.clone(),
             );
             (Some(tx), Some(task))
         } else {
@@ -176,42 +297,78 @@ impl ZerobusStream {
             table_properties.clone(),
             Arc::clone(&headers_provider),
             options.clone(),
+            kind,
             Arc::clone(&landing_zone),
             Arc::clone(&oneshot_map),
             logical_last_received_offset_id_tx.clone(),
             Arc::clone(&is_closed),
+            Arc::clone(&sync_mutex),
+            terminal_token.clone(),
             Arc::clone(&failed_records),
             stream_init_result_tx,
             server_error_tx,
             cancellation_token.clone(),
             callback_tx.clone(),
         ));
-        let stream_id = Some(stream_init_result_rx.await.map_err(|_| {
+        let initialization_guard = StreamInitializationGuard::new(
+            cancellation_token.clone(),
+            supervisor_task,
+            callback_handler_task,
+        );
+        let init_info = stream_init_result_rx.await.map_err(|_| {
             ZerobusError::UnexpectedStreamResponseError(
                 "Supervisor task died before stream creation".to_string(),
             )
-        })??);
+        })??;
+        let (supervisor_task, callback_handler_task) = initialization_guard.disarm();
+
+        // On a persistent resume, continue offset generation past the server's
+        // committed offset so newly ingested records get the next durable
+        // offsets rather than restarting at 0. Also seed the last-received-offset
+        // watch to the watermark: everything up to it is already durable, so a
+        // `flush()` / `wait_for_offset()` targeting an already-committed offset
+        // must resolve immediately. Without this the watch stays `None` and, on a
+        // fresh-process resume with no new ingests, `flush()` (and the `close()`
+        // that calls it) would block until the flush timeout and then error,
+        // since the server never re-acks offsets it committed in a prior session.
+        // Safe because the constructor returns before any user ingest, so no real
+        // ack can race this initial value.
+        // TODO: Validate the resume watermark before spawning tasks, or cancel and abort
+        // the spawned tasks on post-initialization errors so their handles are not detached.
+        if let Some(watermark) = init_info.last_committed_offset {
+            let next_offset = watermark.checked_add(1).ok_or_else(|| {
+                ZerobusError::UnexpectedStreamResponseError(
+                    "Persistent stream offset space is exhausted".to_string(),
+                )
+            })?;
+            logical_offset_id_generator.set_next(next_offset);
+            let _ = logical_last_received_offset_id_tx.send(Some(watermark));
+        }
 
         // Cloned out before `table_properties` is moved into the struct below.
         let dynamic_message_descriptor = table_properties.message_descriptor.clone();
         let stream = Self {
-            stream_type: StreamType::Ephemeral,
+            stream_type,
             headers_provider,
             options: options.clone(),
             table_properties,
-            stream_id,
+            stream_id: Some(init_info.stream_id),
+            last_committed_offset: init_info.last_committed_offset,
             landing_zone,
             oneshot_map,
             supervisor_task,
+            supervisor_shutdown_result: None,
             logical_offset_id_generator,
             logical_last_received_offset_id_tx,
             _logical_last_received_offset_id_rx,
             failed_records,
             is_closed,
-            sync_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            sync_mutex,
+            terminal_token,
             server_error_rx,
             cancellation_token,
             callback_handler_task,
+            callback_cancellation_token,
             dynamic_message_descriptor,
         };
 
@@ -246,6 +403,7 @@ impl ZerobusStream {
 impl Drop for ZerobusStream {
     fn drop(&mut self) {
         self.is_closed.store(true, Ordering::Relaxed);
+        self.terminal_token.cancel();
         self.cancellation_token.cancel();
         self.supervisor_task.abort();
         if let Some(callback_handler_task) = self.callback_handler_task.take() {

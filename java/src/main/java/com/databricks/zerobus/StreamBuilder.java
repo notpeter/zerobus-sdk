@@ -12,8 +12,8 @@ import org.apache.arrow.vector.types.pojo.Schema;
  * the Rust SDK. Shared setters may be called in any order before selecting a record format. Because
  * Java cannot return different stream types from a single {@code build()}, the record format is
  * selected with a terminal method that returns a typed sub-builder: {@link #json()}, {@link
- * #compiledProto(DescriptorProto)}, or {@link #arrow(Schema)}. Each sub-builder exposes a {@code
- * build()} that returns the matching stream type.
+ * #compiledProto(DescriptorProto)}, {@link #avro(String)}, or {@link #arrow(Schema)}. Each
+ * sub-builder exposes a {@code build()} that returns the matching stream type.
  *
  * <h3>Thread Safety</h3>
  *
@@ -35,9 +35,10 @@ public final class StreamBuilder {
   private String clientSecret;
   private HeadersProvider headersProvider;
 
-  // Shared and gRPC configuration. A {@code null} value means "not set", so each record format
-  // falls back to its own defaults (for example Arrow defaults to 4 recovery retries while gRPC
-  // defaults to 3). This mirrors the Rust builder, which keeps separate gRPC and Arrow configs.
+  // Shared and JSON/protobuf configuration. A {@code null} value means "not set", so each record
+  // format falls back to its own defaults (for example Arrow defaults to 4 recovery retries while
+  // JSON/protobuf defaults to 3). This mirrors the Rust builder, which keeps separate JSON/protobuf
+  // and Arrow configs.
   private Integer maxInflightRecords;
   private Boolean recovery;
   private Integer recoveryTimeoutMs;
@@ -165,7 +166,7 @@ public final class StreamBuilder {
   /**
    * Sets the maximum number of in-flight records.
    *
-   * <p>Applies to JSON and Protocol Buffer (gRPC) streams. It is ignored for Arrow streams, which
+   * <p>Applies to JSON, Protocol Buffer, and Avro streams. It is ignored for Arrow streams, which
    * use {@link ArrowStreamBuilder#maxInflightBatches(int)} instead.
    *
    * @param maxInflightRecords the maximum number of in-flight records
@@ -180,8 +181,8 @@ public final class StreamBuilder {
   /**
    * Sets the acknowledgment callback.
    *
-   * <p>Applies to JSON and Protocol Buffer (gRPC) streams only. Arrow Flight streams do not support
-   * ACK callbacks; configuring one and calling {@link ArrowStreamBuilder#build()} throws {@link
+   * <p>Applies to JSON, Protocol Buffer, and Avro streams. Arrow Flight streams do not support ACK
+   * callbacks; configuring one and calling {@link ArrowStreamBuilder#build()} throws {@link
    * IllegalStateException}.
    *
    * @param ackCallback the acknowledgment callback
@@ -215,15 +216,25 @@ public final class StreamBuilder {
   /**
    * Selects the Arrow Flight record format.
    *
-   * <p><b>Beta:</b> Arrow Flight ingestion is in Beta. The API is stabilising but may still change
-   * before reaching GA.
-   *
    * @param schema the Arrow schema describing the columns of the target table
    * @return an {@link ArrowStreamBuilder} that builds a {@link ZerobusArrowStream}
    */
   public ArrowStreamBuilder arrow(Schema schema) {
     Objects.requireNonNull(schema, "schema");
     return new ArrowStreamBuilder(this, schema);
+  }
+
+  /**
+   * Selects the Avro record format (Beta).
+   *
+   * <p>Ingesting record objects requires Java 11+ and the {@code org.apache.avro:avro} dependency
+   * on the classpath; the pre-encoded {@code byte[]} path needs neither.
+   *
+   * @param schemaJson the Avro writer schema as a JSON string
+   * @return an {@link AvroStreamBuilder} that builds a {@link ZerobusAvroStream}
+   */
+  public AvroStreamBuilder avro(String schemaJson) {
+    return new AvroStreamBuilder(this, requireNonBlank(schemaJson, "schemaJson"));
   }
 
   // ==================== Package-private helpers ====================
@@ -278,7 +289,10 @@ public final class StreamBuilder {
     return value == null || value.trim().isEmpty();
   }
 
-  /** Builds the gRPC stream options, applying only the values that were explicitly set. */
+  /**
+   * Builds JSON and Protocol Buffer stream options, applying only the values that were explicitly
+   * set.
+   */
   StreamConfigurationOptions toStreamOptions() {
     StreamConfigurationOptions.StreamConfigurationOptionsBuilder builder =
         StreamConfigurationOptions.builder();
@@ -336,6 +350,34 @@ public final class StreamBuilder {
     }
   }
 
+  /** Builds a {@link ZerobusAvroStream}. Created via {@link StreamBuilder#avro(String)}. */
+  public static final class AvroStreamBuilder {
+    private final StreamBuilder base;
+    private final String schemaJson;
+
+    private AvroStreamBuilder(StreamBuilder base, String schemaJson) {
+      this.base = base;
+      this.schemaJson = schemaJson;
+    }
+
+    /**
+     * Builds and opens the Avro stream.
+     *
+     * @return a future that completes with the {@link ZerobusAvroStream} when ready
+     * @throws IllegalStateException if the table name or authentication has not been set
+     */
+    public CompletableFuture<ZerobusAvroStream> build() {
+      base.validateRequired();
+      return base.sdk.createAvroStreamInternal(
+          base.tableName,
+          schemaJson,
+          base.clientId,
+          base.clientSecret,
+          base.headersProvider,
+          base.toStreamOptions());
+    }
+  }
+
   /** Builds a {@link ZerobusProtoStream}. Created via {@link StreamBuilder#compiledProto}. */
   public static final class ProtoStreamBuilder {
     private final StreamBuilder base;
@@ -364,11 +406,7 @@ public final class StreamBuilder {
     }
   }
 
-  /**
-   * Builds a {@link ZerobusArrowStream}. Created via {@link StreamBuilder#arrow(Schema)}.
-   *
-   * <p><b>Beta:</b> Arrow Flight ingestion is in Beta.
-   */
+  /** Builds a {@link ZerobusArrowStream}. Created via {@link StreamBuilder#arrow(Schema)}. */
   public static final class ArrowStreamBuilder {
     private final StreamBuilder base;
     private final Schema schema;
@@ -408,9 +446,10 @@ public final class StreamBuilder {
     }
 
     /**
-     * Sets the Arrow IPC compression codec.
+     * Sets the Arrow IPC compression codec. Defaults to {@link IPCCompressionType#ZSTD}; pass
+     * {@link IPCCompressionType#NONE} to send uncompressed payloads.
      *
-     * @param ipcCompression the compression codec to use
+     * @param ipcCompression the compression codec to use, or {@code null} for the default
      * @return this builder for method chaining
      */
     public ArrowStreamBuilder ipcCompression(IPCCompressionType ipcCompression) {

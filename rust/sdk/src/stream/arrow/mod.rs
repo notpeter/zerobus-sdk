@@ -1,8 +1,5 @@
 //! Arrow Flight stream API for high-performance Arrow data ingestion.
 //!
-//! **Beta**: This module is in Beta. The API is stabilising but may still change
-//! before reaching GA.
-//!
 //! This directory module provides [`ZerobusArrowStream`] for ingesting Arrow
 //! [`RecordBatch`] data into Databricks Delta tables using Arrow Flight. Native Rust
 //! callers use [`ZerobusArrowStream::ingest_batch`] with `RecordBatch` values; FFI
@@ -31,12 +28,16 @@ pub use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use self::batch::{materialize_ipc, PendingBatch};
 use self::close::{CloseCoordinator, CloseFinalizer, CloseRequest, CloseState};
 use self::connection::RequestBodyRegistry;
-pub use self::options::ArrowStreamConfigurationOptions;
+pub use self::options::{
+    ArrowCompression, ArrowDictionaryHandling, ArrowStreamConfigurationOptions,
+};
 use self::supervisor::{Supervisor, SupervisorTaskHandle};
 use crate::errors::{should_retry_initial_connection, ZerobusError};
+use crate::grpc_status::GrpcStatus;
 use crate::headers_provider::HeadersProvider;
 use crate::offset_generator::{OffsetId, OffsetIdGenerator};
 use crate::proxy::ConnectorFactory;
+use crate::stats::StatsExporter;
 use crate::tls_config::TlsConfig;
 use crate::ZerobusResult;
 
@@ -46,14 +47,24 @@ pub(crate) mod c_data;
 mod acks;
 mod batch;
 mod close;
+mod compressed_sizes;
 mod connection;
 mod metadata;
 mod options;
+mod stats_size;
 mod supervisor;
 
 const LOG_TARGET: &str = module_path!();
 
-type BatchSender = Arc<Mutex<Option<mpsc::Sender<Result<RecordBatch, FlightError>>>>>;
+/// One item on the encoder channel: a batch paired with its SDK offset and optional
+/// transmission counter, shared with the pending batch across reconnects.
+pub(super) struct OutboundBatch {
+    pub(super) offset: OffsetId,
+    pub(super) send_attempts: Option<Arc<AtomicU32>>,
+    pub(super) batch: RecordBatch,
+}
+type BatchItem = Result<OutboundBatch, FlightError>;
+type BatchSender = Arc<Mutex<Option<mpsc::Sender<BatchItem>>>>;
 
 struct FlightConnectionParameters<'a> {
     endpoint: &'a str,
@@ -64,6 +75,7 @@ struct FlightConnectionParameters<'a> {
     headers_provider: &'a Arc<dyn HeadersProvider>,
     sdk_identifier: &'a str,
     request_bodies: &'a RequestBodyRegistry,
+    stats_exporter: Option<Arc<dyn StatsExporter>>,
     #[cfg(feature = "test-hooks")]
     test_hooks: &'a Arc<TestHooks>,
 }
@@ -103,6 +115,7 @@ struct TestHooks {
     ack_applied: TestNotifyGate,
     ack_idle: TestNotifyGate,
     failed_enqueue: TestBarrierGate,
+    ingest_admission: TestBarrierGate,
     close_finalize: TestBarrierGate,
     request_body_before_batch_poll: TestBarrierGate,
     request_body_shutdown: TestBarrierGate,
@@ -242,6 +255,9 @@ pub struct ZerobusArrowStream {
     /// Either `"zerobus-sdk-rs/<version>"` or `"zerobus-sdk-rs/<version> <application_name>"`.
     /// Re-applied to each fresh Channel built during recovery.
     sdk_identifier: Arc<str>,
+    /// Optional telemetry sink; when set, the encoder emits `BatchSent` (with byte
+    /// sizes) per batch and the ack path emits `BatchAcked`.
+    stats_exporter: Option<Arc<dyn StatsExporter>>,
     #[cfg(feature = "test-hooks")]
     test_hooks: Arc<TestHooks>,
 }
@@ -254,6 +270,7 @@ impl ZerobusArrowStream {
     /// One available retry may refresh credentials after an authentication rejection;
     /// a second authentication rejection remains terminal.
     #[instrument(level = "debug", skip_all, fields(table_name = %table_properties.table_name))]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
         endpoint: &str,
         tls_config: Arc<dyn TlsConfig>,
@@ -262,6 +279,7 @@ impl ZerobusArrowStream {
         headers_provider: Arc<dyn HeadersProvider>,
         options: ArrowStreamConfigurationOptions,
         sdk_identifier: Arc<str>,
+        stats_exporter: Option<Arc<dyn StatsExporter>>,
     ) -> ZerobusResult<Self> {
         // A zero bound would deadlock every ingest and panic the zero-capacity channel.
         if options.max_inflight_batches == 0 {
@@ -335,6 +353,7 @@ impl ZerobusArrowStream {
             inflight,
             server_error_tx,
             server_error_rx,
+            stats_exporter,
             cumulative_records_assigned,
             submitted_records,
             last_acked_records,
@@ -364,6 +383,7 @@ impl ZerobusArrowStream {
             let headers_provider = Arc::clone(&headers_provider);
             let sdk_identifier = Arc::clone(&stream.sdk_identifier);
             let request_bodies = request_bodies.clone();
+            let stats_exporter = stream.stats_exporter.clone();
             #[cfg(feature = "test-hooks")]
             let test_hooks = Arc::clone(&stream.test_hooks);
 
@@ -377,6 +397,7 @@ impl ZerobusArrowStream {
                     headers_provider: &headers_provider,
                     sdk_identifier: &sdk_identifier,
                     request_bodies: &request_bodies,
+                    stats_exporter,
                     #[cfg(feature = "test-hooks")]
                     test_hooks: &test_hooks,
                 };
@@ -467,6 +488,14 @@ impl ZerobusArrowStream {
             return Err(Self::stream_closing_or_closed_error());
         }
 
+        self.validate_batch(&batch)?;
+        let permit = self.reserve_capacity().await?;
+        self.enqueue_reserved_admitted(batch, permit, || Ok(()))
+            .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn validate_batch(&self, batch: &RecordBatch) -> ZerobusResult<()> {
         if batch.schema() != self.table_properties.schema {
             return Err(ZerobusError::InvalidArgument(format!(
                 "RecordBatch schema does not match stream schema. Expected: {:?}, Got: {:?}",
@@ -475,6 +504,11 @@ impl ZerobusArrowStream {
             )));
         }
 
+        Self::validate_nonempty_batch(batch)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn validate_nonempty_batch(batch: &RecordBatch) -> ZerobusResult<()> {
         // Reject empty batches: the Flight encoder emits no data message for a zero-row
         // RecordBatch, so it would enter pending_batches but never be sent or acknowledged,
         // hanging flush()/wait_for_offset() until they time out.
@@ -484,21 +518,56 @@ impl ZerobusArrowStream {
             ));
         }
 
-        // Acquire the backpressure permit BEFORE ingest_mutex: reconnect() holds that
-        // mutex, so blocking on a permit while holding it could stall recovery.
-        // `inflight` is never closed, so the map_err is unreachable defensive code.
-        // Permit waiters wake when acknowledgments or finalization release pending
-        // permits, then re-check both lifecycle flags below.
-        let permit = Arc::clone(&self.inflight)
-            .acquire_owned()
-            .await
-            .map_err(|_| {
-                ZerobusError::StreamClosedError(tonic::Status::internal("Stream is closed"))
-            })?;
+        Ok(())
+    }
 
+    /// Reserves capacity without holding the lifecycle mutex or consuming an offset.
+    pub(crate) async fn reserve_capacity(
+        &self,
+    ) -> ZerobusResult<tokio::sync::OwnedSemaphorePermit> {
+        let mut close_rx = self.close.subscribe();
+        if self.is_ingest_admission_closed() {
+            return Err(Self::stream_closing_or_closed_error());
+        }
+        tokio::select! {
+            // An available permit wins without polling the close watcher. Admission
+            // is checked again under `ingest_mutex` if close starts concurrently.
+            biased;
+            permit = Arc::clone(&self.inflight).acquire_owned() => {
+                permit.map_err(|_| Self::stream_closing_or_closed_error())
+            }
+            _ = close_rx.changed() => Err(Self::stream_closing_or_closed_error()),
+        }
+    }
+
+    /// Only finalized errors are terminal; recovery publishes transient errors too.
+    pub(crate) async fn terminal_error(&self) -> Option<ZerobusError> {
+        if self.is_ingest_admission_closed() {
+            self.wait_for_terminal_outcome().await.err()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) async fn enqueue_reserved_admitted<F>(
+        &self,
+        batch: RecordBatch,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        admit: F,
+    ) -> ZerobusResult<OffsetId>
+    where
+        F: FnOnce() -> ZerobusResult<()>,
+    {
+        #[cfg(feature = "test-hooks")]
+        {
+            let barrier = self.test_hooks.ingest_admission.lock().await.take();
+            if let Some(barrier) = barrier {
+                barrier.reached.notify_one();
+                barrier.proceed.notified().await;
+            }
+        }
         let _guard = self.ingest_mutex.lock().await;
-
-        // May have closed while we blocked on the permit; returning drops it.
+        admit()?;
         if self.is_ingest_admission_closed() {
             return Err(Self::stream_closing_or_closed_error());
         }
@@ -509,6 +578,10 @@ impl ZerobusArrowStream {
             .cumulative_records_assigned
             .fetch_add(record_count, Ordering::Relaxed);
         let end_record = start_record + record_count;
+        let send_attempts = self
+            .stats_exporter
+            .as_ref()
+            .map(|_| Arc::new(AtomicU32::new(0)));
 
         {
             let mut pending = self.pending_batches.lock().await;
@@ -517,6 +590,7 @@ impl ZerobusArrowStream {
                 offset_id,
                 start_record,
                 end_record,
+                send_attempts.clone(),
                 permit,
             ));
         }
@@ -596,7 +670,11 @@ impl ZerobusArrowStream {
         {
             let _pending = self.pending_batches.lock().await;
             self.submitted_records.store(end_record, Ordering::Release);
-            send_permit.send(Ok(batch));
+            send_permit.send(Ok(OutboundBatch {
+                offset: offset_id,
+                send_attempts,
+                batch,
+            }));
         }
         // Notify after publishing `submitted_records`: waking earlier could let the ACK
         // processor observe the batch as buffered-but-unsent and go idle again.
@@ -609,7 +687,7 @@ impl ZerobusArrowStream {
     /// Ingests a single Arrow RecordBatch supplied as raw Arrow IPC stream bytes.
     ///
     /// Convenience wrapper for callers that already hold IPC-serialised bytes.
-    /// Deserialises the bytes to a [`RecordBatch`] and delegates to `ingest_batch`.
+    /// Deserialises the bytes to a [`RecordBatch`] and queues it.
     /// Prefer `ingest_batch` directly when you already have a [`RecordBatch`].
     ///
     /// The `ipc_bytes` must be a valid Arrow IPC *stream* containing exactly one
@@ -623,10 +701,16 @@ impl ZerobusArrowStream {
             return Err(Self::stream_closing_or_closed_error());
         }
 
-        // Deserialise IPC bytes into a RecordBatch.
-        let batch = materialize_ipc(&ipc_bytes)
-            .map_err(|e| ZerobusError::InvalidArgument(format!("Invalid Arrow IPC bytes: {e}")))?;
+        let batch = self.prepare_ipc_batch(&ipc_bytes)?;
+        let permit = self.reserve_capacity().await?;
+        self.enqueue_reserved_admitted(batch, permit, || Ok(()))
+            .await
+    }
 
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn prepare_ipc_batch(&self, ipc_bytes: &Bytes) -> ZerobusResult<RecordBatch> {
+        let batch = materialize_ipc(ipc_bytes)
+            .map_err(|e| ZerobusError::InvalidArgument(format!("Invalid Arrow IPC bytes: {e}")))?;
         if batch.schema() != self.table_properties.schema {
             return Err(ZerobusError::InvalidArgument(format!(
                 "IPC batch schema does not match stream schema. Expected: {:?}, Got: {:?}",
@@ -634,8 +718,8 @@ impl ZerobusArrowStream {
                 batch.schema()
             )));
         }
-
-        self.ingest_batch(batch).await
+        Self::validate_nonempty_batch(&batch)?;
+        Ok(batch)
     }
 
     /// Internal method to wait for a specific offset to be acknowledged.
@@ -694,7 +778,7 @@ impl ZerobusArrowStream {
                 tokio::select! {
                     result = offset_rx.changed() => {
                         if result.is_err() {
-                            return Err(ZerobusError::StreamClosedError(tonic::Status::internal(
+                            return Err(ZerobusError::StreamClosedError(GrpcStatus::internal(
                                 format!(
                                     "Ack channel closed during {}",
                                     operation_name.to_lowercase()
@@ -709,7 +793,7 @@ impl ZerobusArrowStream {
 
         timeout(flush_timeout, wait_future).await.map_err(|_| {
             error!(target: LOG_TARGET, "{} timed out", operation_name);
-            ZerobusError::StreamClosedError(tonic::Status::deadline_exceeded(format!(
+            ZerobusError::StreamClosedError(GrpcStatus::deadline_exceeded(format!(
                 "{} timed out",
                 operation_name
             )))
@@ -1104,6 +1188,13 @@ impl ZerobusArrowStream {
         *self.batch_tx.lock().await = Some(closed_tx);
     }
 
+    /// Test-only: pauses a reserved batch before taking the lifecycle lock.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub async fn arm_ingest_admission_barrier(&self) -> (Arc<Notify>, Arc<Notify>) {
+        Self::arm_test_barrier(&self.test_hooks.ingest_admission).await
+    }
+
     /// Test-only: parks a recovery-disabled failed enqueue after it claims terminal
     /// admission and before it releases `ingest_mutex` or wakes the supervisor.
     #[cfg(feature = "test-hooks")]
@@ -1210,18 +1301,24 @@ impl ZerobusArrowStream {
         Arc::clone(&self.headers_provider)
     }
 
-    fn is_ingest_admission_closed(&self) -> bool {
+    /// The registered telemetry exporter, if any. Used to carry it across
+    /// `recreate_arrow_stream`.
+    pub(crate) fn stats_exporter(&self) -> Option<Arc<dyn StatsExporter>> {
+        self.stats_exporter.clone()
+    }
+
+    pub(crate) fn is_ingest_admission_closed(&self) -> bool {
         self.admission_closed.load(Ordering::Acquire)
             || self.is_closed.load(Ordering::Relaxed)
             || self.close.has_started()
     }
 
     fn stream_closing_or_closed_error() -> ZerobusError {
-        ZerobusError::StreamClosedError(tonic::Status::internal("Stream is closing or closed"))
+        ZerobusError::StreamClosedError(GrpcStatus::internal("Stream is closing or closed"))
     }
 
     fn close_coordinator_stopped_error() -> ZerobusError {
-        ZerobusError::StreamClosedError(tonic::Status::internal(
+        ZerobusError::StreamClosedError(GrpcStatus::internal(
             "Close coordinator stopped unexpectedly",
         ))
     }
@@ -1232,7 +1329,7 @@ impl ZerobusArrowStream {
     ) -> ZerobusError {
         let terminal_error = error_rx.borrow().clone();
         terminal_error.unwrap_or_else(|| {
-            ZerobusError::StreamClosedError(tonic::Status::internal(fallback_message()))
+            ZerobusError::StreamClosedError(GrpcStatus::internal(fallback_message()))
         })
     }
 }

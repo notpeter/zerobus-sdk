@@ -13,7 +13,7 @@ The Databricks Zerobus Ingest SDK for Java provides a high-performance client fo
 - [Usage Examples](#usage-examples)
   - [Protocol Buffers Examples](#protocol-buffers-examples)
   - [JSON Examples](#json-examples)
-  - [Arrow Flight Examples (Beta)](#arrow-flight-examples-beta)
+  - [Arrow Flight Examples](#arrow-flight-examples)
 - [Authentication](#authentication)
 - [API Styles](#api-styles)
   - [Offset-Based API (Recommended)](#offset-based-api-recommended)
@@ -34,7 +34,8 @@ The Databricks Zerobus Ingest SDK for Java provides a high-performance client fo
 - **Flexible configuration**: Customizable stream behavior and timeouts
 - **Protocol Buffers**: Strongly-typed schema using protobuf
 - **JSON support**: Ingest JSON records without Protocol Buffer schemas
-- **Arrow Flight (Beta)**: Columnar ingestion of Apache Arrow `VectorSchemaRoot` batches
+- **Arrow Flight**: Columnar ingestion of Apache Arrow `VectorSchemaRoot` batches
+- **Avro** *(Beta)*: Ingest Avro record objects (need Java 11+) or pre-encoded datums (see [Avro Examples](#avro-examples))
 - **Offset-based API**: Low-overhead alternative to CompletableFuture for high throughput
 - **OAuth 2.0 authentication**: Secure authentication with client credentials
 - **Custom authentication**: Supply request headers with `HeadersProvider`
@@ -118,6 +119,17 @@ On Linux, the libc flavor (glibc vs musl) is detected at runtime. To override de
     <groupId>org.apache.arrow</groupId>
     <artifactId>arrow-memory-netty</artifactId>
     <version>17.0.0</version>
+</dependency>
+```
+
+**When ingesting Avro record objects (`ZerobusAvroStream`, Beta)** — additional dependency, opt-in, and requires **Java 11+** at runtime (Apache Avro 1.12 is compiled for Java 11). The pre-encoded `byte[]` path needs neither:
+- [`avro` 1.12.2](https://mvnrepository.com/artifact/org.apache.avro/avro/1.12.2)
+
+```xml
+<dependency>
+    <groupId>org.apache.avro</groupId>
+    <artifactId>avro</artifactId>
+    <version>1.12.2</version>
 </dependency>
 ```
 
@@ -332,7 +344,7 @@ wget https://repo1.maven.org/maven2/com/databricks/zerobus-ingest-sdk/1.4.0/zero
 
 ```bash
 java -jar zerobus-ingest-sdk-1.4.0-jar-with-dependencies.jar \
-  --uc-endpoint "https://dbc-a1b2c3d4-e5f6.cloud.databricks.com" \
+  --uc-endpoint "<your-databricks-workspace-url>" \
   --client-id "your-service-principal-application-id" \
   --client-secret "your-service-principal-secret" \
   --table "main.default.air_quality" \
@@ -341,7 +353,7 @@ java -jar zerobus-ingest-sdk-1.4.0-jar-with-dependencies.jar \
 ```
 
 **Parameters:**
-- `--uc-endpoint`: Your workspace URL (e.g., `https://dbc-a1b2c3d4-e5f6.cloud.databricks.com`)
+- `--uc-endpoint`: Your workspace URL from the [connection URL table](https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id)
 - `--client-id`: Service principal application ID
 - `--client-secret`: Service principal secret
 - `--table`: Fully qualified table name (catalog.schema.table)
@@ -413,7 +425,9 @@ For detailed documentation and examples, see [tools/README.md](https://github.co
 > [Acknowledgments and throughput](#acknowledgments-and-throughput) below the example for
 > how acknowledgment works and when to use `waitForOffset()` or an `AckCallback`.
 
-Create `src/main/java/com/example/ZerobusClient.java`:
+Create `src/main/java/com/example/ZerobusClient.java`. It reads the connection settings from
+environment variables; see the [connection URL table](https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id)
+for the `ZEROBUS_SERVER_ENDPOINT` and `DATABRICKS_WORKSPACE_URL` formats on each cloud:
 
 ```java
 package com.example;
@@ -424,11 +438,11 @@ import com.example.proto.Record.AirQuality;
 public class ZerobusClient {
     public static void main(String[] args) throws Exception {
         // Configuration
-        String serverEndpoint = "https://1234567890123456.zerobus.us-west-2.cloud.databricks.com";
-        String workspaceUrl = "https://dbc-a1b2c3d4-e5f6.cloud.databricks.com";
-        String tableName = "main.default.air_quality";
-        String clientId = "your-service-principal-application-id";
-        String clientSecret = "your-service-principal-secret";
+        String serverEndpoint = System.getenv("ZEROBUS_SERVER_ENDPOINT");
+        String workspaceUrl = System.getenv("DATABRICKS_WORKSPACE_URL");
+        String tableName = System.getenv("ZEROBUS_TABLE_NAME");
+        String clientId = System.getenv("DATABRICKS_CLIENT_ID");
+        String clientSecret = System.getenv("DATABRICKS_CLIENT_SECRET");
 
         try (ZerobusSdk sdk = new ZerobusSdk(serverEndpoint, workspaceUrl);
              ZerobusProtoStream stream = sdk.streamBuilder()
@@ -465,6 +479,13 @@ public class ZerobusClient {
 ```bash
 # First, compile the proto file to generate Java classes
 protoc --java_out=src/main/java src/main/proto/record.proto
+
+# Set the connection settings
+export ZEROBUS_SERVER_ENDPOINT="<your-zerobus-server-endpoint>"
+export DATABRICKS_WORKSPACE_URL="<your-databricks-workspace-url>"
+export ZEROBUS_TABLE_NAME="main.default.air_quality"
+export DATABRICKS_CLIENT_ID="<your-oauth-client-id>"
+export DATABRICKS_CLIENT_SECRET="<your-oauth-client-secret>"
 
 # Compile and run
 mvn compile
@@ -532,7 +553,7 @@ examples/
 │   ├── README.md
 │   ├── SingleRecordExample.java
 │   └── BatchIngestionExample.java
-├── arrow/                 # ZerobusArrowStream example (Beta)
+├── arrow/                 # ZerobusArrowStream example
 │   ├── README.md
 │   └── ArrowIngestionExample.java
 └── legacy/                # ZerobusStream (deprecated)
@@ -565,12 +586,21 @@ try (ZerobusJsonStream jsonStream = sdk.streamBuilder()
     // ingest...
 }
 
-// Arrow Flight (Beta)
+// Arrow Flight
 try (ZerobusArrowStream arrowStream = sdk.streamBuilder()
         .table("catalog.schema.table")
         .oauth(clientId, clientSecret)
         .arrow(schema)
-        .ipcCompression(IPCCompressionType.ZSTD)
+        .build()
+        .join()) {
+    // ingest...
+}
+
+// Avro (Beta; record objects need Java 11+ and org.apache.avro:avro)
+try (ZerobusAvroStream avroStream = sdk.streamBuilder()
+        .table("catalog.schema.table")
+        .oauth(clientId, clientSecret)
+        .avro(schemaJson)
         .build()
         .join()) {
     // ingest...
@@ -639,7 +669,7 @@ try (ZerobusJsonStream stream = sdk.streamBuilder()
 
 See [`examples/README.md`](https://github.com/databricks/zerobus-sdk/blob/main/java/examples/README.md) for detailed documentation.
 
-### Arrow Flight Examples (Beta)
+### Arrow Flight Examples
 
 Best for columnar data, wide/numeric schemas, or applications that already produce Apache Arrow `VectorSchemaRoot` batches (Spark, pandas via PyArrow bridges, columnar gateways). Requires the `arrow-vector` and `arrow-memory-netty` dependencies plus the JDK 9+ `--add-opens` flags (see [Dependencies](#dependencies) and [`examples/arrow/README.md`](https://github.com/databricks/zerobus-sdk/blob/main/java/examples/arrow/README.md)):
 
@@ -673,7 +703,61 @@ try (ZerobusArrowStream stream = sdk.streamBuilder()
 }
 ```
 
-> **Beta.** Arrow Flight ingestion is in Beta. The API is stabilising but may still change before reaching GA.
+### Avro Examples
+
+*(Beta.)* Best when your data is already Avro-native. Declare the writer schema as JSON, then ingest
+`GenericRecord` objects (encoded against the schema) or pre-encoded Avro datums (`byte[]`). Ingesting
+`GenericRecord`s requires **Java 11+** and the `org.apache.avro:avro` dependency; the `byte[]` path
+needs neither.
+
+```java
+String schemaJson = "{\"type\":\"record\",\"name\":\"Order\",\"fields\":["
+    + "{\"name\":\"id\",\"type\":\"long\"},{\"name\":\"customer\",\"type\":\"string\"}]}";
+Schema schema = new Schema.Parser().parse(schemaJson);
+
+try (ZerobusAvroStream stream = sdk.streamBuilder()
+        .table(tableName)
+        .oauth(clientId, clientSecret)
+        .avro(schemaJson)
+        .build()
+        .join()) {
+    for (Order order : orders) {
+        GenericRecord record = new GenericData.Record(schema);
+        record.put("id", order.id);
+        record.put("customer", order.customer);
+        stream.ingestRecordOffset(record);     // GenericRecord, or a pre-encoded byte[]
+    }
+    stream.flush();                            // confirm durability once, not per record
+}
+```
+
+A pre-encoded `byte[]` must be a **bare** Avro binary datum written with the writer schema. Framed
+forms — Avro container files, single-object encoding, and Confluent-framed bytes — are not accepted.
+
+Build records with the Java value each Avro type expects. Date/time, `decimal`, and `uuid` logical
+types also accept their raw underlying primitive.
+
+| Avro type | Java value |
+|-----------|------------|
+| boolean / int / long / float / double | `Boolean` / `Integer` / `Long` / `Float` / `Double` |
+| string | `String` |
+| bytes | `java.nio.ByteBuffer` |
+| record / array / map | `GenericRecord` / `java.util.List` / `java.util.Map<String,?>` |
+| enum | `GenericData.EnumSymbol` |
+| fixed | `GenericData.Fixed` |
+| union | the branch value (resolved by its Java type); `null` for a null branch |
+| date | `java.time.LocalDate` |
+| time-millis / time-micros | `java.time.LocalTime` |
+| timestamp-millis / timestamp-micros | `java.time.Instant` |
+| local-timestamp-millis / local-timestamp-micros | `java.time.LocalDateTime` |
+| decimal | `java.math.BigDecimal` |
+| uuid | `java.util.UUID` |
+
+Notes: a `BigDecimal` may have fewer fractional digits than the schema scale but not more (Avro
+won't round) and must fit the precision. Schema defaults are **not** applied to unset fields of a
+`GenericData.Record` — set every field, or use `GenericRecordBuilder`. Each record's schema (nested
+records included) must match the writer schema: field order matters and the namespace must match,
+though metadata such as `avro.java.string` or docs is ignored.
 
 ---
 
@@ -700,7 +784,8 @@ try (ZerobusJsonStream stream = sdk.streamBuilder()
 }
 ```
 
-The same provider works with the builder's `compiledProto()` and `arrow()` format selectors.
+The same provider works with the builder's `compiledProto()`, `avro()`, and `arrow()` format
+selectors.
 Providers may override `invalidate()` to clear cached credentials after an authentication
 rejection. Implementations must be thread-safe because the SDK can invoke them from internal
 threads during creation and recovery.
@@ -813,7 +898,7 @@ stream.flush();
 |--------|----------|------|------|
 | **Protocol Buffers** | Production systems | Type-safe, compact, fast | Requires schema compilation |
 | **JSON** | Prototyping, flexible schemas | Human-readable, no compilation, clean API | Larger payload, slower |
-| **Arrow Flight** (Beta) | Columnar/analytics workloads, wide/numeric schemas, applications that already produce Arrow data | High throughput, native Apache Arrow types, optional IPC compression (LZ4 / ZSTD) | Requires `arrow-vector` + `arrow-memory-netty` deps and JDK 9+ `--add-opens` flags; API may still change before GA |
+| **Arrow Flight** | Columnar/analytics workloads, wide/numeric schemas, applications that already produce Arrow data | High throughput, native Apache Arrow types, IPC compression (ZSTD by default; LZ4 or none optional) | Requires `arrow-vector` + `arrow-memory-netty` deps and JDK 9+ `--add-opens` flags |
 
 ### JSON Streams (Recommended for JSON)
 
@@ -872,7 +957,7 @@ try (ZerobusJsonStream stream = sdk.streamBuilder()
 | `serverLackOfAckTimeoutMs` | 60000 | Server acknowledgment timeout (ms) |
 | `ackCallback` | None | Callback invoked on record acknowledgment |
 
-### Arrow Stream Configuration Options (Beta)
+### Arrow Stream Configuration Options
 
 Used with `ZerobusArrowStream`. Build via `ArrowStreamConfigurationOptions.builder()`.
 
@@ -886,7 +971,7 @@ Used with `ZerobusArrowStream`. Build via `ArrowStreamConfigurationOptions.build
 | `serverLackOfAckTimeoutMs` | 60000 | Server acknowledgment timeout (ms) |
 | `flushTimeoutMs` | 300000 | Timeout for flush operations (ms) |
 | `connectionTimeoutMs` | 30000 | Timeout for establishing a gRPC connection (ms) |
-| `ipcCompression` | `IPCCompressionType.NONE` | Arrow IPC compression codec on the wire (`NONE`, `LZ4_FRAME`, `ZSTD`) |
+| `ipcCompression` | `IPCCompressionType.ZSTD` | Arrow IPC compression codec on the wire (`NONE`, `LZ4_FRAME`, `ZSTD`). Pass `NONE` to send uncompressed payloads |
 | `streamPausedMaxWaitTimeMs` | `-1` | Max time to wait in the paused state during graceful close. `-1` = full server duration, `0` = immediate recovery, `>0` = `min(this, server_duration)` ms |
 
 `ackCallback` is not supported for Arrow Flight streams. Configuring it on `StreamBuilder` before calling `ArrowStreamBuilder.build()` throws `IllegalStateException`.
@@ -1030,11 +1115,23 @@ Main entry point for the SDK.
 **Constructors:**
 ```java
 ZerobusSdk(String serverEndpoint, String unityCatalogEndpoint)
+ZerobusSdk(String serverEndpoint, String unityCatalogEndpoint, boolean connectionPerStream)
 ZerobusSdk(String serverEndpoint, String unityCatalogEndpoint, String applicationName)
+ZerobusSdk(String serverEndpoint, String unityCatalogEndpoint, String applicationName, boolean connectionPerStream)
 ```
-- `serverEndpoint` - The Zerobus gRPC endpoint (e.g., `https://<workspace-id>.zerobus.region.cloud.databricks.com`)
-- `unityCatalogEndpoint` - The Unity Catalog endpoint (your workspace URL)
+- `serverEndpoint` - The Zerobus gRPC endpoint from the [connection URL table](https://github.com/databricks/zerobus-sdk/blob/main/README.md#1-connection-urls-and-workspace-id)
+- `unityCatalogEndpoint` - Your Databricks workspace URL, used for Unity Catalog and OAuth
 - `applicationName` (optional) - Application identifier appended to the HTTP `user-agent` header, conventionally `"<product>/<version>"` (e.g. `"my-app/1.0"`). Pass `null` to omit.
+- `connectionPerStream` (optional) - Gives each JSON/protobuf stream a dedicated
+  gRPC connection. Constructors without this argument default to `true`; pass
+  `false` to share one HTTP/2 connection. Arrow Flight streams are unaffected.
+
+HTTP/2 multiplexes logical streams over one TCP connection. On high-throughput
+workloads over the public internet, packet loss and TCP retransmissions can
+cause head-of-line blocking across every stream on that connection, reducing
+aggregate throughput. Dedicated connections isolate that loss. For many
+smaller, low-throughput streams, pass `false`; shared multiplexing is
+recommended there to reduce connection overhead.
 
 **Methods:**
 
@@ -1099,7 +1196,7 @@ CompletableFuture<ZerobusArrowStream> createArrowStream(
     String clientSecret
 )
 ```
-**Beta.** Creates a new Arrow Flight ingestion stream with default configuration. Requires `arrow-vector` + `arrow-memory-netty` on the classpath. _Deprecated — use [`streamBuilder()`](#streambuilder)._
+Creates a new Arrow Flight ingestion stream with default configuration. Requires `arrow-vector` + `arrow-memory-netty` on the classpath. _Deprecated — use [`streamBuilder()`](#streambuilder)._
 
 ```java
 CompletableFuture<ZerobusArrowStream> createArrowStream(
@@ -1110,12 +1207,12 @@ CompletableFuture<ZerobusArrowStream> createArrowStream(
     ArrowStreamConfigurationOptions options
 )
 ```
-**Beta.** Same as above with custom configuration. _Deprecated — use [`streamBuilder()`](#streambuilder)._
+Same as above with custom configuration. _Deprecated — use [`streamBuilder()`](#streambuilder)._
 
 ```java
 CompletableFuture<ZerobusArrowStream> recreateArrowStream(ZerobusArrowStream closedStream)
 ```
-**Beta.** Recreates an Arrow stream from a closed stream, re-ingesting unacknowledged batches and flushing.
+Recreates an Arrow stream from a closed stream, re-ingesting unacknowledged batches and flushing.
 
 ---
 
@@ -1133,13 +1230,14 @@ StreamBuilder recoveryBackoffMs(int ms)
 StreamBuilder recoveryRetries(int n)
 StreamBuilder serverLackOfAckTimeoutMs(int ms)
 StreamBuilder flushTimeoutMs(int ms)
-StreamBuilder maxInflightRecords(int n)          // JSON/proto only
-StreamBuilder ackCallback(AckCallback callback)  // JSON/proto only
+StreamBuilder maxInflightRecords(int n)          // JSON/proto/Avro (not Arrow)
+StreamBuilder ackCallback(AckCallback callback)  // JSON/proto/Avro (not Arrow)
 
 // Format selection -> typed sub-builder:
 JsonStreamBuilder  json()
 ProtoStreamBuilder compiledProto(DescriptorProto descriptorProto)
-ArrowStreamBuilder arrow(Schema schema)          // Beta
+AvroStreamBuilder  avro(String schemaJson)       // Beta; GenericRecord ingestion needs Java 11 + org.apache.avro:avro
+ArrowStreamBuilder arrow(Schema schema)
 ```
 
 Each sub-builder exposes `build()`:
@@ -1147,7 +1245,8 @@ Each sub-builder exposes `build()`:
 ```java
 CompletableFuture<ZerobusJsonStream>  StreamBuilder.JsonStreamBuilder.build()
 CompletableFuture<ZerobusProtoStream> StreamBuilder.ProtoStreamBuilder.build()
-CompletableFuture<ZerobusArrowStream> StreamBuilder.ArrowStreamBuilder.build()   // Beta
+CompletableFuture<ZerobusAvroStream>  StreamBuilder.AvroStreamBuilder.build()
+CompletableFuture<ZerobusArrowStream> StreamBuilder.ArrowStreamBuilder.build()
 ```
 
 `ArrowStreamBuilder` additionally supports `maxInflightBatches(int)`, `connectionTimeoutMs(long)`, `ipcCompression(IPCCompressionType)`, and `streamPausedMaxWaitTimeMs(long)`.
@@ -1254,9 +1353,43 @@ Returns unacknowledged records grouped by batch.
 
 ---
 
-### ZerobusArrowStream (Beta)
+### ZerobusAvroStream
 
-> **Beta.** Arrow Flight ingestion is in Beta. The API is stabilising but may still change before reaching GA.
+Stream for Avro ingestion (Beta). Use `ZerobusSdk.streamBuilder().avro(schemaJson)` to create instances. Ingesting `GenericRecord`s requires Java 11+ and `org.apache.avro:avro` on the classpath; the pre-encoded `byte[]` path needs neither.
+
+**Single Record Methods:**
+
+```java
+long ingestRecordOffset(GenericRecord record) throws ZerobusException
+```
+Encodes a record against the writer schema and returns the offset immediately.
+
+```java
+long ingestRecordOffset(byte[] encodedBytes) throws ZerobusException
+```
+Ingests a bare, pre-encoded Avro datum (no container/single-object/Confluent framing) and returns the offset immediately.
+
+**Batch Methods:**
+
+```java
+Optional<Long> ingestRecordsOffset(Iterable<? extends GenericRecord> records) throws ZerobusException
+Optional<Long> ingestRecordsOffset(List<byte[]> encodedRecords) throws ZerobusException
+```
+Ingests a batch of records (encoded) or bare pre-encoded datums and returns the batch offset.
+
+**Recovery Methods:**
+
+```java
+List<byte[]> getUnackedRecords() throws ZerobusException
+List<EncodedBatch> getUnackedBatches() throws ZerobusException
+```
+Returns unacknowledged records as raw Avro datums, or grouped by batch.
+
+**Lifecycle Methods:** `waitForOffset()`, `flush()`, `close()`, `isClosed()`, `getTableName()`, `getOptions()`
+
+---
+
+### ZerobusArrowStream
 
 Stream for Apache Arrow Flight ingestion of `VectorSchemaRoot` batches. Use `ZerobusSdk.streamBuilder().arrow()` to create instances. Requires `arrow-vector` + `arrow-memory-netty` on the classpath and JDK 9+ `--add-opens` flags (see [Dependencies](#dependencies)).
 
@@ -1278,9 +1411,9 @@ Returns unacknowledged batches as serialized Arrow IPC byte arrays. After the st
 
 ---
 
-### ArrowStreamConfigurationOptions (Beta)
+### ArrowStreamConfigurationOptions
 
-Configuration options for `ZerobusArrowStream`. Build via `ArrowStreamConfigurationOptions.builder()`. See [Arrow Stream Configuration Options](#arrow-stream-configuration-options-beta) for the full table of fields and defaults.
+Configuration options for `ZerobusArrowStream`. Build via `ArrowStreamConfigurationOptions.builder()`. See [Arrow Stream Configuration Options](#arrow-stream-configuration-options) for the full table of fields and defaults.
 
 **Static Methods:**
 
@@ -1310,7 +1443,7 @@ Example:
 ```java
 ArrowStreamConfigurationOptions options = ArrowStreamConfigurationOptions.builder()
     .setMaxInflightBatches(2000)
-    .setIpcCompression(IPCCompressionType.ZSTD)
+    .setIpcCompression(IPCCompressionType.LZ4_FRAME)
     .setRecovery(true)
     .setRecoveryRetries(5)
     .build();
@@ -1318,17 +1451,17 @@ ArrowStreamConfigurationOptions options = ArrowStreamConfigurationOptions.builde
 
 ---
 
-### IPCCompressionType (Enum, Beta)
+### IPCCompressionType (Enum)
 
 Selects the Arrow IPC compression codec applied to each batch on the wire. Set via `ArrowStreamConfigurationOptions.builder().setIpcCompression(...)`.
 
 **Values:**
 
-- `NONE` — No compression (default).
+- `NONE` — No compression.
 - `LZ4_FRAME` — LZ4 frame compression. Fast, modest ratio.
-- `ZSTD` — Zstandard. Higher ratio at higher CPU cost.
+- `ZSTD` — Zstandard (default). Higher ratio at higher CPU cost.
 
-Compression trades client CPU for fewer bytes on the wire. Enable only when network bandwidth limits throughput.
+Compression trades client CPU for fewer bytes on the wire. Pass `NONE` if client CPU, not network bandwidth, limits throughput.
 
 ---
 
