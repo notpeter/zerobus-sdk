@@ -14,7 +14,7 @@ jobs:
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk'
           && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
-          || 'ubuntu-latest' }}
+          || 'ubuntu-24.04' }}
     defaults:
       run:
         working-directory: purego
@@ -43,7 +43,7 @@ jobs:
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk'
           && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
-          || 'ubuntu-latest' }}
+          || 'ubuntu-24.04' }}
     defaults:
       run:
         working-directory: purego
@@ -101,7 +101,7 @@ jobs:
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk'
           && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
-          || 'ubuntu-latest' }}
+          || 'ubuntu-24.04' }}
     defaults:
       run:
         working-directory: purego
@@ -135,7 +135,7 @@ jobs:
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk'
           && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
-          || 'ubuntu-latest' }}
+          || 'ubuntu-24.04' }}
     defaults:
       run:
         working-directory: purego

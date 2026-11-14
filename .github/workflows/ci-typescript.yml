@@ -18,7 +18,7 @@ jobs:
     name: Build - ${{ matrix.target }}
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk' && matrix.runner
-          || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-latest') }}
+          || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-24.04') }}
     defaults:
       run:
         working-directory: typescript
@@ -85,7 +85,7 @@ jobs:
     name: Test Node.js ${{ matrix.node }} - ${{ matrix.os }}
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk' && matrix.runner
-          || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-latest') }}
+          || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-24.04') }}
     strategy:
       fail-fast: false
       matrix:

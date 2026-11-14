@@ -13,7 +13,7 @@ jobs:
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk'
           && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
-          || 'ubuntu-latest' }}
+          || 'ubuntu-24.04' }}
     defaults:
       run:
         working-directory: go
@@ -58,7 +58,7 @@ jobs:
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk'
           && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
-          || 'ubuntu-latest' }}
+          || 'ubuntu-24.04' }}
     defaults:
       run:
         working-directory: go
@@ -107,7 +107,7 @@ jobs:
             runner: { group: databricks-protected-runner-group, labels: windows-server-latest }
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk' && matrix.runner
-          || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-latest') }}
+          || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-24.04') }}
     defaults:
       run:
         working-directory: go
@@ -178,7 +178,7 @@ jobs:
             lib: lib/windows_amd64/libzerobus_ffi.a
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk' && matrix.runner
-          || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-latest') }}
+          || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-24.04') }}
     defaults:
       run:
         working-directory: go

@@ -38,7 +38,7 @@ jobs:
             pyVersion: '3.14'
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk' && matrix.runner
-          || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-latest') }}
+          || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-24.04') }}
     defaults:
       run:
         working-directory: python
@@ -90,7 +90,7 @@ jobs:
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk'
           && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
-          || 'ubuntu-latest' }}
+          || 'ubuntu-24.04' }}
     defaults:
       run:
         working-directory: python
@@ -157,7 +157,7 @@ jobs:
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk'
           && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
-          || 'ubuntu-latest' }}
+          || 'ubuntu-24.04' }}
     defaults:
       run:
         working-directory: python
@@ -196,7 +196,7 @@ jobs:
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk'
           && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
-          || 'ubuntu-latest' }}
+          || 'ubuntu-24.04' }}
     defaults:
       run:
         working-directory: python

@@ -13,7 +13,7 @@ jobs:
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk'
           && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
-          || 'ubuntu-latest' }}
+          || 'ubuntu-24.04' }}
     needs: [changes, rust, java, typescript, python, go, purego, purec, cpp, dotnet, orchestrator]
     if: always()
     steps:
@@ -42,7 +42,7 @@ jobs:
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk'
           && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
-          || 'ubuntu-latest' }}
+          || 'ubuntu-24.04' }}
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       java: ${{ steps.filter.outputs.java }}
@@ -174,7 +174,7 @@ jobs:
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk'
           && fromJSON('{"group":"databricks-protected-runner-group","labels":"linux-ubuntu-latest"}')
-          || 'ubuntu-latest' }}
+          || 'ubuntu-24.04' }}
     permissions:
       id-token: write
       contents: read
