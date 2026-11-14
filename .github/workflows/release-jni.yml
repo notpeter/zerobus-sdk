@@ -12,7 +12,7 @@ on:
 
 jobs:
   import-macos:
-    if: inputs.macos-binaries-release != ''
+    if: github.repository == 'databricks/zerobus-sdk' && (inputs.macos-binaries-release != '')
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
@@ -51,6 +51,7 @@ jobs:
           if-no-files-found: error
 
   build-jni:
+    if: github.repository == 'databricks/zerobus-sdk'
     strategy:
       fail-fast: false
       matrix:
@@ -105,13 +106,10 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Get JFrog OIDC token
-        shell: bash
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
-
-      - name: Configure cargo for JFrog
-        shell: bash
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-cargo.sh"
+      - name: Set up package registries
+        uses: ./.github/actions/setup-registries
+        with:
+          registries: cargo
 
       - name: Install protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3

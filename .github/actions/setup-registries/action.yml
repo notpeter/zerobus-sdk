@@ -1,0 +1,28 @@
+name: Set up package registries
+description: Configure JFrog on upstream runners; forks keep public registries.
+inputs:
+  registries:
+    description: Space-separated registries to configure (cargo, go, maven, npm, pip).
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Authenticate and configure JFrog
+      if: github.repository == 'databricks/zerobus-sdk'
+      shell: bash
+      env:
+        REGISTRIES: ${{ inputs.registries }}
+        SCRIPTS_DIR: ${{ github.action_path }}/../../scripts
+      run: |
+        source "$SCRIPTS_DIR/jfrog-oidc-token.sh"
+        for registry in $REGISTRIES; do
+          case "$registry" in
+            cargo|go|maven|npm|pip)
+              bash "$SCRIPTS_DIR/configure-$registry.sh"
+              ;;
+            *)
+              echo "Unknown registry: $registry" >&2
+              exit 1
+              ;;
+          esac
+        done

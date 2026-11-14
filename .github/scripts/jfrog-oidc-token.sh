@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Exchange a GitHub Actions OIDC token for a JFrog access token and
-# write JFROG_ACCESS_TOKEN to $GITHUB_ENV so subsequent steps can use it.
+# export JFROG_ACCESS_TOKEN for callers that source this script and write it
+# to $GITHUB_ENV so subsequent steps can use it.
 
 # Get GitHub OIDC ID token
 ID_TOKEN=$(curl -sLS \
@@ -22,6 +23,7 @@ if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
   exit 1
 fi
 
+export JFROG_ACCESS_TOKEN="$ACCESS_TOKEN"
 echo "JFROG_ACCESS_TOKEN=${ACCESS_TOKEN}" >> "$GITHUB_ENV"
 
 echo "JFrog OIDC token obtained successfully"
