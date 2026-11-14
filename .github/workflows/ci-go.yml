@@ -19,27 +19,10 @@ jobs:
         working-directory: go
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Get JFrog OIDC token
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
-      - name: Configure Cargo registry
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-cargo.sh"
-      - name: Configure Go registry
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: |
-          echo "GOPROXY=https://databricks.jfrog.io/artifactory/api/go/db-golang,direct" >> "$GITHUB_ENV"
-          echo "GONOSUMDB=*" >> "$GITHUB_ENV"
-          cat > ~/.netrc << EOF
-          machine databricks.jfrog.io
-          login gha-service-account
-          password ${JFROG_ACCESS_TOKEN}
-          EOF
-          chmod 600 ~/.netrc
-          echo "Go configured to use JFrog registry"
+      - name: Set up package registries
+        uses: ./.github/actions/setup-registries
+        with:
+          registries: cargo go
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.25'
@@ -64,27 +47,10 @@ jobs:
         working-directory: go
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Get JFrog OIDC token
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
-      - name: Configure Cargo registry
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-cargo.sh"
-      - name: Configure Go registry
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: |
-          echo "GOPROXY=https://databricks.jfrog.io/artifactory/api/go/db-golang,direct" >> "$GITHUB_ENV"
-          echo "GONOSUMDB=*" >> "$GITHUB_ENV"
-          cat > ~/.netrc << EOF
-          machine databricks.jfrog.io
-          login gha-service-account
-          password ${JFROG_ACCESS_TOKEN}
-          EOF
-          chmod 600 ~/.netrc
-          echo "Go configured to use JFrog registry"
+      - name: Set up package registries
+        uses: ./.github/actions/setup-registries
+        with:
+          registries: cargo go
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.25'
@@ -97,13 +63,14 @@ jobs:
         run: make lint
 
   test:
+    name: Test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: linux-ubuntu-latest
+          - os: Linux
             runner: { group: databricks-protected-runner-group, labels: linux-ubuntu-latest }
-          - os: windows-server-latest
+          - os: Windows
             runner: { group: databricks-protected-runner-group, labels: windows-server-latest }
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk' && matrix.runner
@@ -114,27 +81,10 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Get JFrog OIDC token
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
-      - name: Configure Cargo registry
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-cargo.sh"
-      - name: Configure Go registry
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: |
-          echo "GOPROXY=https://databricks.jfrog.io/artifactory/api/go/db-golang,direct" >> "$GITHUB_ENV"
-          echo "GONOSUMDB=*" >> "$GITHUB_ENV"
-          cat > ~/.netrc << EOF
-          machine databricks.jfrog.io
-          login gha-service-account
-          password ${JFROG_ACCESS_TOKEN}
-          EOF
-          chmod 600 ~/.netrc
-          echo "Go configured to use JFrog registry"
+      - name: Set up package registries
+        uses: ./.github/actions/setup-registries
+        with:
+          registries: cargo go
       - name: Unshallow
         run: git fetch --prune --unshallow
 
@@ -165,15 +115,16 @@ jobs:
         run: make examples
 
   user-experience:
+    name: Published artifacts (${{ matrix.os }})
     if: inputs.run_published_artifact_tests
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: linux-ubuntu-latest
+          - os: Linux
             runner: { group: databricks-protected-runner-group, labels: linux-ubuntu-latest }
             lib: lib/linux_amd64/libzerobus_ffi.a
-          - os: windows-server-latest
+          - os: Windows
             runner: { group: databricks-protected-runner-group, labels: windows-server-latest }
             lib: lib/windows_amd64/libzerobus_ffi.a
     runs-on: >-
@@ -185,27 +136,10 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Get JFrog OIDC token
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
-      - name: Configure Cargo registry
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-cargo.sh"
-      - name: Configure Go registry
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: |
-          echo "GOPROXY=https://databricks.jfrog.io/artifactory/api/go/db-golang,direct" >> "$GITHUB_ENV"
-          echo "GONOSUMDB=*" >> "$GITHUB_ENV"
-          cat > ~/.netrc << EOF
-          machine databricks.jfrog.io
-          login gha-service-account
-          password ${JFROG_ACCESS_TOKEN}
-          EOF
-          chmod 600 ~/.netrc
-          echo "Go configured to use JFrog registry"
+      - name: Set up package registries
+        uses: ./.github/actions/setup-registries
+        with:
+          registries: cargo go
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.25'

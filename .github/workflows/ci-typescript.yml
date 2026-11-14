@@ -25,18 +25,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Get JFrog OIDC token
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
-      - name: Configure Cargo registry
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-cargo.sh"
-      - name: Configure npm registry
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-npm.sh"
+      - name: Set up package registries
+        uses: ./.github/actions/setup-registries
+        with:
+          registries: cargo npm
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -82,7 +74,7 @@ jobs:
           if-no-files-found: error
 
   test:
-    name: Test Node.js ${{ matrix.node }} - ${{ matrix.os }}
+    name: Test (${{ matrix.os }}, Node.js ${{ matrix.node }})
     runs-on: >-
       ${{ github.repository == 'databricks/zerobus-sdk' && matrix.runner
           || (matrix.runner.labels == 'windows-server-latest' && 'windows-latest' || 'ubuntu-24.04') }}
@@ -90,16 +82,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: linux-ubuntu-latest
+          - os: Linux
             runner: { group: databricks-protected-runner-group, labels: linux-ubuntu-latest }
             node: '16'
-          - os: linux-ubuntu-latest
+          - os: Linux
             runner: { group: databricks-protected-runner-group, labels: linux-ubuntu-latest }
             node: '18'
-          - os: linux-ubuntu-latest
+          - os: Linux
             runner: { group: databricks-protected-runner-group, labels: linux-ubuntu-latest }
             node: '20'
-          - os: windows-server-latest
+          - os: Windows
             runner: { group: databricks-protected-runner-group, labels: windows-server-latest }
             node: '20'
     defaults:
@@ -108,18 +100,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Get JFrog OIDC token
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/jfrog-oidc-token.sh"
-      - name: Configure Cargo registry
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-cargo.sh"
-      - name: Configure npm registry
-        if: github.repository == 'databricks/zerobus-sdk'
-        shell: bash
-        run: bash "$GITHUB_WORKSPACE/.github/scripts/configure-npm.sh"
+      - name: Set up package registries
+        uses: ./.github/actions/setup-registries
+        with:
+          registries: cargo npm
       - name: Setup Node.js ${{ matrix.node }}
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
